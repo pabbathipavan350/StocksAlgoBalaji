@@ -1,0 +1,94 @@
+name: run-algo
+
+on:
+  # Auto-run Mon-Fri at 9:07 AM IST (3:37 AM UTC)
+  schedule:
+    - cron: '37 3 * * 1-5'
+
+  # Manual trigger from Actions tab anytime
+  workflow_dispatch:
+
+jobs:
+  run-algo:
+    name: Run Main Script
+    runs-on: ubuntu-latest
+    environment: MyAlog
+    timeout-minutes: 390   # 6.5 hrs
+
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
+
+      KOTAK_CONSUMER_KEY: ${{ secrets.KOTAK_CONSUMER_KEY }}
+      KOTAK_CONSUMER_SECRET: ${{ secrets.KOTAK_CONSUMER_SECRET }}
+      KOTAK_MOBILE_NUMBER: ${{ secrets.KOTAK_MOBILE_NUMBER }}
+      KOTAK_UCC: ${{ secrets.KOTAK_UCC }}
+      KOTAK_MPIN: ${{ secrets.KOTAK_MPIN }}
+
+      # Force Kotak environment to PROD
+      KOTAK_ENVIRONMENT: "PROD"
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Restore capital.json from previous run
+      - name: Restore capital state
+        uses: actions/cache@v4
+        with:
+          path: capital.json
+          key: capital-state-${{ github.ref_name }}
+          restore-keys: |
+            capital-state-
+
+      # Prepare folders
+      - name: Prepare output folders
+        run: mkdir -p logs reports
+
+      # Run algo
+      - name: Run algo
+        run: python main.py
+        continue-on-error: true
+
+      # Always flush logs even if algo crashes
+      - name: Flush logs
+        if: always()
+        run: |
+          mkdir -p logs reports
+          echo "--- workflow ended at $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> logs/workflow.log
+          echo "--- files saved ---" >> logs/workflow.log
+          ls -lh logs/ reports/ 2>/dev/null >> logs/workflow.log || true
+
+      # Upload logs/reports
+      - name: Upload logs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algo-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            logs/
+            reports/
+            capital.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Save updated capital.json for next run
+      - name: Save capital state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: capital.json
+          key: capital-state-${{ github.ref_name }}-${{ github.run_number }}
