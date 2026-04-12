@@ -1,11 +1,8 @@
 name: run-algo
 
 on:
-  # Auto-run Mon-Fri at 9:07 AM IST (3:37 AM UTC)
   schedule:
-    - cron: '37 3 * * 1-5'
-
-  # Manual trigger from Actions tab anytime
+    - cron: '37 3 * * 1-5'   # 9:07 AM IST
   workflow_dispatch:
 
 jobs:
@@ -13,7 +10,7 @@ jobs:
     name: Run Main Script
     runs-on: ubuntu-latest
     environment: MyAlog
-    timeout-minutes: 390   # 6.5 hrs
+    timeout-minutes: 390
 
     env:
       TZ: Asia/Kolkata
@@ -24,8 +21,8 @@ jobs:
       KOTAK_MOBILE_NUMBER: ${{ secrets.KOTAK_MOBILE_NUMBER }}
       KOTAK_UCC: ${{ secrets.KOTAK_UCC }}
       KOTAK_MPIN: ${{ secrets.KOTAK_MPIN }}
+      TOTP_SECRET_KEY: ${{ secrets.TOTP_SECRET_KEY }}
 
-      # Force Kotak environment to PROD
       KOTAK_ENVIRONMENT: "PROD"
 
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -38,54 +35,70 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
+      - name: Prepare folders
+        run: |
+          mkdir -p logs reports
+
+      - name: Show env presence check
+        run: |
+          echo "KOTAK_CONSUMER_KEY present: $([[ -n "$KOTAK_CONSUMER_KEY" ]] && echo yes || echo no)"
+          echo "KOTAK_MOBILE_NUMBER present: $([[ -n "$KOTAK_MOBILE_NUMBER" ]] && echo yes || echo no)"
+          echo "KOTAK_UCC present: $([[ -n "$KOTAK_UCC" ]] && echo yes || echo no)"
+          echo "KOTAK_MPIN present: $([[ -n "$KOTAK_MPIN" ]] && echo yes || echo no)"
+          echo "TOTP_SECRET_KEY present: $([[ -n "$TOTP_SECRET_KEY" ]] && echo yes || echo no)"
+          echo "KOTAK_ENVIRONMENT: $KOTAK_ENVIRONMENT"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore capital.json from previous run
       - name: Restore capital state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: capital.json
           key: capital-state-${{ github.ref_name }}
           restore-keys: |
             capital-state-
 
-      # Prepare folders
-      - name: Prepare output folders
-        run: mkdir -p logs reports
+      - name: Run algo and capture full logs
+        run: |
+          echo "=== Workflow started at $(date '+%Y-%m-%d %H:%M:%S %Z') ===" | tee -a logs/workflow.log
+          echo "=== Running main.py ===" | tee -a logs/workflow.log
+          set -o pipefail
+          python main.py 2>&1 | tee -a logs/main_console.log logs/workflow.log
 
-      # Run algo
-      - name: Run algo
-        run: python main.py
-        continue-on-error: true
-
-      # Always flush logs even if algo crashes
       - name: Flush logs
         if: always()
         run: |
           mkdir -p logs reports
-          echo "--- workflow ended at $(date '+%Y-%m-%d %H:%M:%S %Z') ---" >> logs/workflow.log
-          echo "--- files saved ---" >> logs/workflow.log
-          ls -lh logs/ reports/ 2>/dev/null >> logs/workflow.log || true
+          {
+            echo ""
+            echo "=== Workflow ended at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+            echo "=== Files present ==="
+            ls -R
+            echo ""
+            echo "=== logs folder ==="
+            ls -lh logs || true
+            echo ""
+            echo "=== reports folder ==="
+            ls -lh reports || true
+          } >> logs/workflow.log
 
-      # Upload logs/reports
       - name: Upload logs and reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: algo-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
-            logs/
-            reports/
+            logs/**
+            reports/**
             capital.json
           retention-days: 30
           if-no-files-found: warn
 
-      # Save updated capital.json for next run
       - name: Save capital state
         if: always()
         uses: actions/cache/save@v4
