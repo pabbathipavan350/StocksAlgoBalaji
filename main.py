@@ -111,6 +111,9 @@ class GapVWAPAlgo:
         self._last_tick_time  = now_ist()
         self._circuit_alerted = False
 
+        # WebSocket connection state
+        self._ws_connected    = False
+
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT,  self._handle_sigterm)
 
@@ -173,12 +176,62 @@ class GapVWAPAlgo:
 
     def _on_ws_open(self, *args):
         print("[WS] Connected")
+        self._ws_connected = True
 
     def _on_ws_error(self, error):
+        # Suppress noisy "already closed" errors — these are normal during reconnect
+        err_str = str(error)
+        if "already closed" in err_str or "NoneType" in err_str:
+            self.logger.debug(f"[WS] Suppressed: {err_str}")
+            return
         self.logger.error(f"[WS] Error: {error}")
 
     def _on_ws_close(self, *args):
+        self._ws_connected = False
         self.logger.warning("[WS] Closed")
+        # Auto-reconnect in background only if algo is still running
+        if self._running:
+            threading.Thread(
+                target=self._ws_reconnect_loop,
+                daemon=True,
+                name="WSReconnect"
+            ).start()
+
+    def _ws_reconnect_loop(self):
+        """
+        Reconnect with backoff when WS drops mid-session.
+        Mirrors v3 pattern: 5s → 10s → 20s → 30s delays.
+        Re-subscribes all tokens once connection is restored.
+        """
+        delays = [5, 10, 20, 30]
+        for attempt, delay in enumerate(delays, 1):
+            if not self._running:
+                return
+            print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+            time.sleep(delay)
+            if not self._running:
+                return
+            try:
+                self._setup_websocket()
+                # Re-subscribe all tokens in one batch
+                all_tokens = [
+                    {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
+                    for tok in self._subscribed_tokens
+                ]
+                if all_tokens:
+                    # Subscribe in chunks — single connection, multiple tokens
+                    for i in range(0, len(all_tokens), 50):
+                        self.client.subscribe(
+                            instrument_tokens=all_tokens[i:i+50],
+                            isIndex=False,
+                            isDepth=False,
+                        )
+                        time.sleep(0.5)   # give WS time to process each batch
+                print(f"[WS] ✅ Reconnected — re-subscribed {len(all_tokens)} tokens")
+                return
+            except Exception as e:
+                self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
+        print("[WS] ❌ All reconnect attempts failed — session manager will handle")
 
     # ── Gap Scan at 9:15 ─────────────────────────────────
 
@@ -239,10 +292,18 @@ class GapVWAPAlgo:
         if new_stocks:
             self._subscribe_new_stocks(new_stocks)
 
-        # ── Step 5: On first scan, also subscribe ALL watchlist stocks ─
-        # for TREND_RIDE and VWAP_BREAKOUT signals (not just gap stocks)
+        # ── Step 5: Start REST poll loop on first scan ────────────────────────
+        # WS subscription is ONLY for gap stocks (already done in Step 4).
+        # Non-gap stocks are NOT subscribed via WS — subscribing 500 stocks was
+        # the root cause of WS connection errors and spurious TREND signals.
+        # A lightweight REST poll runs every 30s as a heartbeat/fallback for
+        # gap stocks when WS ticks slow down.
         if is_first_scan:
-            self._subscribe_full_watchlist()
+            threading.Thread(
+                target=self._rest_poll_loop,
+                daemon=True,
+                name="RESTPoller"
+            ).start()
 
         # Telegram alert only on first scan
         if is_first_scan:
@@ -258,7 +319,12 @@ class GapVWAPAlgo:
             self.telegram.alert_gap_list(new_up, new_down)
 
     def _subscribe_new_stocks(self, new_stocks: list):
-        """Subscribe only newly found gap stocks to WS and register VWAP trackers."""
+        """
+        Subscribe newly found gap stocks to WS and register VWAP trackers.
+        Key rule (from v3): the FIRST subscribe() call opens the WS connection.
+        Subsequent calls add tokens to the existing open connection.
+        Never call subscribe() in rapid parallel — always sequential with delay.
+        """
         tokens_to_sub = []
         for info in new_stocks:
             token = info["token"]
@@ -280,21 +346,24 @@ class GapVWAPAlgo:
         if not tokens_to_sub:
             return
 
-        # Subscribe in batches of 50
-        for i in range(0, len(tokens_to_sub), 50):
-            batch = tokens_to_sub[i:i+50]
-            try:
-                self.client.subscribe(
-                    instrument_tokens=batch,
-                    isIndex=False,
-                    isDepth=False,
-                )
-            except Exception as e:
-                self.logger.error(f"[WS] Subscribe error: {e}")
-            time.sleep(0.1)
+        def _do_subscribe():
+            # Subscribe all tokens — one batch per 1s, non-blocking
+            for i in range(0, len(tokens_to_sub), 50):
+                batch = tokens_to_sub[i:i+50]
+                try:
+                    self.client.subscribe(
+                        instrument_tokens=batch,
+                        isIndex=False,
+                        isDepth=False,
+                    )
+                    time.sleep(1.0)
+                except Exception as e:
+                    self.logger.error(f"[WS] Subscribe error: {e}")
+                    time.sleep(2.0)
+            print(f"[WS] ✅ Subscribed {len(tokens_to_sub)} new stocks  "
+                  f"(total watching: {self.vwap_mgr.active_count})")
 
-        print(f"[WS] ✅ Subscribed {len(tokens_to_sub)} new stocks  "
-              f"(total watching: {self.vwap_mgr.active_count})")
+        threading.Thread(target=_do_subscribe, daemon=True, name="GapSubscribe").start()
 
     # ── WebSocket Tick Handler ────────────────────────────
 
@@ -413,46 +482,141 @@ class GapVWAPAlgo:
 
     # ── Reconnect ─────────────────────────────────────────
 
-    def _subscribe_full_watchlist(self):
+    def _rest_poll_loop(self):
         """
-        Subscribe ALL watchlist stocks (not just gap stocks) at market open.
-        This enables TREND_RIDE and VWAP_BREAKOUT signals on any liquid stock.
-        Runs once at 9:15 — after gap stocks are already subscribed.
+        REST poll every 30s for gap stocks only.
+
+        WHY this replaces _subscribe_full_watchlist:
+          - Old code subscribed ALL ~500 watchlist stocks via WS → flooded the
+            single WS connection → connection errors + 35 spurious TREND trades
+            on stocks with no gap thesis.
+          - WS is now ONLY used for gap stocks (subscribed in _subscribe_new_stocks).
+          - This loop polls ltp + ap (exchange VWAP) every 30s via the REST
+            quotes API as a heartbeat. If WS ticks arrive normally, the REST
+            values just confirm them. If WS is slow/silent, REST keeps the
+            VWAP tracker fresh enough to catch the cross signal.
+
+        Batch size 50 matches Kotak's quotes API limit (same as gap_scanner).
         """
-        scrips        = self.gap_scanner.scrips
-        tokens_to_sub = []
-        added         = 0
+        REST_POLL_INTERVAL = 30   # seconds between full polls
+        print("[REST] Poll loop started — heartbeat every 30s for gap stocks only")
 
-        for symbol, info in scrips.items():
-            token = info["token"]
-            if token in self._subscribed_tokens:
-                continue   # already subscribed as gap stock
-            tokens_to_sub.append({
-                "instrument_token": token,
-                "exchange_segment": config.CM_SEGMENT,
-            })
-            # gap_direction = "NONE" → enables TREND_RIDE + VWAP_BREAKOUT + TREND_CONTINUATION
-            self.vwap_mgr.add_stock(symbol=symbol, token=token, gap_direction="NONE")
-            # Also add to watchlist for entry routing
-            self._watchlist[token] = {
-                "symbol"   : symbol,
-                "token"    : token,
-                "direction": "NONE",
-                "gap_pct"  : 0.0,
-                "name"     : info.get("name", symbol),
-                "ltp"      : 0.0,
-                "prev_close": info.get("prev_close", 0.0),
-            }
-            self._subscribed_tokens.add(token)
-            added += 1
+        while self._running:
+            time.sleep(REST_POLL_INTERVAL)
+            if not self._running:
+                break
 
-        if not tokens_to_sub:
-            print("[WS] All watchlist stocks already subscribed")
-            return
+            # Build token list from current gap watchlist only
+            gap_tokens = list(self._subscribed_tokens)
+            if not gap_tokens:
+                continue
 
-        print(f"[WS] Subscribing {added} watchlist stocks for trend/breakout signals...")
-        for i in range(0, len(tokens_to_sub), 50):
-            batch = tokens_to_sub[i:i+50]
+            # Build instrument list for quotes API (same format as gap_scanner)
+            instruments = [
+                {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
+                for tok in gap_tokens
+            ]
+
+            try:
+                for i in range(0, len(instruments), 50):
+                    batch = instruments[i:i+50]
+                    resp  = self.client.quotes(
+                        instrument_tokens=batch,
+                        quote_type="ltp",
+                    )
+                    # Unwrap response — same pattern as gap_scanner
+                    items = []
+                    if isinstance(resp, dict):
+                        items = resp.get("data", resp.get("success", []))
+                    elif isinstance(resp, list):
+                        items = resp
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+
+                        # Extract token
+                        tok = str(item.get("instrument_token") or
+                                  item.get("tk") or
+                                  item.get("token") or "")
+                        if not tok:
+                            continue
+
+                        # Extract ltp
+                        ltp_val = 0.0
+                        ltp_data = item.get("ltp")
+                        if isinstance(ltp_data, dict):
+                            for f in ("ltp", "ltP", "lp"):
+                                v = ltp_data.get(f)
+                                if v:
+                                    try:
+                                        ltp_val = float(v)
+                                        if ltp_val > 0:
+                                            break
+                                    except (TypeError, ValueError):
+                                        pass
+                        if ltp_val <= 0:
+                            for f in ("ltp", "ltP", "lp", "last_price"):
+                                v = item.get(f)
+                                if v and not isinstance(v, dict):
+                                    try:
+                                        ltp_val = float(v)
+                                        if ltp_val > 0:
+                                            break
+                                    except (TypeError, ValueError):
+                                        pass
+
+                        # Extract ap (exchange VWAP)
+                        ap_val = 0.0
+                        for f in ("ap", "aP", "avg_price"):
+                            v = item.get(f)
+                            if v and not isinstance(v, dict):
+                                try:
+                                    ap_val = float(v)
+                                    if ap_val > 0:
+                                        break
+                                except (TypeError, ValueError):
+                                    pass
+
+                        if ltp_val <= 0:
+                            continue
+
+                        # Feed into VWAP tracker as a synthetic tick (REST = not WS)
+                        synthetic_tick = {"ltp": ltp_val, "ap": ap_val}
+                        self.vwap_mgr.on_tick(tok, synthetic_tick, from_ws=False)
+
+                        # Update any open trade for this token
+                        self.trade_mgr.on_tick(tok, ltp_val)
+
+                        # Check entry signals — needed when WS is silent/slow.
+                        # WS handles this on every tick; REST is the fallback.
+                        if self._entries_open and not self.trade_mgr.day_stopped:
+                            self._check_entry_signal(tok, ltp_val)
+
+                    time.sleep(0.3)   # brief pause between batches
+
+            except Exception as e:
+                self.logger.warning(f"[REST] Poll error (non-fatal): {e}")
+
+    # ── Helpers ───────────────────────────────────────────
+
+    def _on_reconnect(self, new_client):
+        """Called by SessionManager after a successful re-login."""
+        self.client              = new_client
+        self.trade_mgr.client    = new_client
+        self.gap_scanner.client  = new_client
+        self._ws_connected       = False
+        self._setup_websocket()
+        time.sleep(2)
+        # Re-subscribe all tokens safely — sequential batches with delay
+        all_tokens = [
+            {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
+            for tok in self._subscribed_tokens
+        ]
+        total = len(all_tokens)
+        print(f"[Reconnect] Re-subscribing {total} tokens...")
+        for i in range(0, total, 50):
+            batch = all_tokens[i:i+50]
             try:
                 self.client.subscribe(
                     instrument_tokens=batch,
@@ -460,39 +624,9 @@ class GapVWAPAlgo:
                     isDepth=False,
                 )
             except Exception as e:
-                self.logger.error(f"[WS] Watchlist subscribe error: {e}")
-            time.sleep(0.15)
-
-        print(f"[WS] ✅ Total watching: {self.vwap_mgr.active_count} stocks  "
-              f"(gap: {len(self._gap_up)+len(self._gap_down)}  "
-              f"trend/breakout: {added})")
-        self.client            = new_client
-        self.trade_mgr.client  = new_client
-        self._setup_websocket()
-        time.sleep(2)
-        # Re-subscribe all watched stocks
-        self._subscribed_tokens.clear()
-        all_stocks = list(self._watchlist.values())
-        if all_stocks:
-            self._subscribe_new_stocks(all_stocks)
-        self.logger.info("[Reconnect] Re-subscribed all gap stocks after session refresh")
-
-    # ── Helpers ───────────────────────────────────────────
-
-    def _on_reconnect(self, new_client):
-        """Called by SessionManager after a successful re-login."""
-        self.client           = new_client
-        self.trade_mgr.client = new_client
-        self.gap_scanner.client = new_client
-        self._setup_websocket()
-        time.sleep(2)
-        # Re-subscribe everything that was subscribed before disconnect
-        self._subscribed_tokens.clear()
-        all_stocks = list(self._watchlist.values())
-        if all_stocks:
-            self._subscribe_new_stocks(all_stocks)
-        self.logger.info(f"[Reconnect] Re-subscribed {len(all_stocks)} stocks after session refresh")
-        print(f"[Reconnect] ✅ Session restored — re-subscribed {len(all_stocks)} stocks")
+                self.logger.error(f"[Reconnect] Subscribe batch error: {e}")
+            time.sleep(1.0)
+        print(f"[Reconnect] ✅ Session restored — re-subscribed {total} stocks")
 
     def _is_market_hours(self, t: datetime.datetime) -> bool:
         open_t = datetime.time(*map(int, config.MARKET_OPEN.split(":")))
@@ -589,6 +723,11 @@ class GapVWAPAlgo:
                     self.run_gap_scan()
                     gap_scanned      = True
                     last_rescan_time = t
+                    # If already past entry time (e.g. started late), open entries now
+                    if t.time() >= self._entry_open_t and not self._entries_open:
+                        self._entries_open = True
+                        print(f"\n[Main] ✅ ENTRIES NOW OPEN — {t.strftime('%H:%M:%S')} IST"
+                              f" (market already past {config.ENTRY_START})")
 
                 # ── Open entries at 9:30 ──────────────────
                 if gap_scanned and not self._entries_open:
@@ -614,13 +753,9 @@ class GapVWAPAlgo:
                     self._entries_open = False
                     print(f"\n[Guard] {config.MAX_CONSEC_SL} consecutive SLs — "
                           f"pausing entries for 30 min (resume {consec_sl_resume.strftime('%H:%M')})")
-                    # Re-open entries after pause if still within entry window
-                    def _reopen_entries(resume_t):
-                        time.sleep(30 * 60)
-                        if now_ist().time() < self._no_new_entry_t:
-                            self._entries_open = True
-                    threading.Thread(target=_reopen_entries,
-                                     args=(consec_sl_resume,), daemon=True).start()
+                    # NOTE: re-opening is handled by the resume check above the pause block.
+                    # No background thread needed — avoids race where thread and main loop
+                    # both set _entries_open at the same time.
 
                 # ── No new entries after 2:30 PM ──────────
                 if self._entries_open and t.time() >= self._no_new_entry_t:

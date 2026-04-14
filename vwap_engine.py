@@ -50,13 +50,14 @@ CROSS_BUFFER_PCT      = 0.05
 
 
 class MinuteBar:
-    __slots__ = ("minute", "vwap", "ltp", "volume", "above_vwap")
-    def __init__(self, minute, vwap, ltp, volume, above_vwap):
+    __slots__ = ("minute", "vwap", "ltp", "volume", "above_vwap", "from_ws")
+    def __init__(self, minute, vwap, ltp, volume, above_vwap, from_ws=True):
         self.minute     = minute
         self.vwap       = vwap
         self.ltp        = ltp
         self.volume     = volume
         self.above_vwap = above_vwap
+        self.from_ws    = from_ws   # False for REST-polled synthetic ticks
 
 
 class VWAPTracker:
@@ -104,7 +105,7 @@ class VWAPTracker:
 
     # ── Tick ─────────────────────────────────────────────
 
-    def on_tick(self, tick: dict):
+    def on_tick(self, tick: dict, from_ws: bool = True):
         ltp_raw = tick.get("ltp") or tick.get("ltP") or tick.get("lp") or 0
         if isinstance(ltp_raw, dict):
             ltp_raw = 0
@@ -120,24 +121,39 @@ class VWAPTracker:
         self.ltp          = ltp
         self.last_tick_ts = now_ist()
         self._tick_count += 1
+        self._last_from_ws = from_ws   # remember source for bar stamping
 
-        tick_vol          = vol if vol > 0 else 1.0
-        self._cum_tp_vol += ((high + low + ltp) / 3.0) * tick_vol
-        self._cum_vol    += tick_vol
+        # ── VWAP: use exchange-computed value (ap = Average Traded Price) ──
+        # Kotak Neo sends 'ap' on every WS tick — this IS the exchange VWAP.
+        # Fall back to self-computing only when ap is absent/zero.
+        ap_raw = tick.get("ap") or tick.get("aP") or tick.get("avg_price") or 0
+        try:
+            ap_val = float(ap_raw)
+        except (TypeError, ValueError):
+            ap_val = 0.0
+
+        tick_vol           = vol if vol > 0 else 1.0
         self._bar_tick_vol += tick_vol
-        self.volume_total  = self._cum_vol
 
-        if self._cum_vol > 0:
-            self.vwap = self._cum_tp_vol / self._cum_vol
+        if ap_val > 0:
+            # Primary path: trust the exchange VWAP directly
+            self.vwap         = ap_val
+            self.volume_total = float(tick.get("ttv") or tick.get("trdVol") or
+                                      tick.get("v")   or self.volume_total)
+        else:
+            # Fallback: self-compute when ap is not present in the tick
+            self._cum_tp_vol += ((high + low + ltp) / 3.0) * tick_vol
+            self._cum_vol    += tick_vol
+            self.volume_total = self._cum_vol
+            if self._cum_vol > 0:
+                self.vwap = self._cum_tp_vol / self._cum_vol
 
         self._update_minute_bar()
 
-        if self.vwap > 0:
-            buf = self.vwap * (CROSS_BUFFER_PCT / 100.0)
-            if ltp > self.vwap + buf:
-                self.was_above = True
-            elif ltp < self.vwap - buf:
-                self.was_above = False
+        # Note: was_above is intentionally NOT updated here.
+        # _check_gap_reversal owns the was_above state machine so it can
+        # detect the exact tick when the cross happens (prev vs current).
+        # Updating it here too would consume the cross before check_signal runs.
 
     def _update_minute_bar(self):
         t = self.last_tick_ts
@@ -154,6 +170,7 @@ class VWAPTracker:
                 ltp        = self.ltp,
                 volume     = self._bar_tick_vol,
                 above_vwap = (self.ltp > self.vwap),
+                from_ws    = getattr(self, "_last_from_ws", True),
             ))
             self._last_bar_minute = mins
             self._bar_tick_vol    = 0.0
@@ -167,32 +184,39 @@ class VWAPTracker:
         if self.vwap <= 0 or self.ltp <= 0:
             return False, "", ""
 
-        # Priority order: reversal first, then trend, then breakout
-        if (self.gap_direction in ("GAP_UP", "GAP_DOWN")
-                and not self._signals_fired[self.SIG_GAP_REVERSAL]):
+        is_gap_stock = self.gap_direction in ("GAP_UP", "GAP_DOWN")
+
+        # ── Signal 1: Gap Reversal (highest priority, gap stocks only) ──
+        if is_gap_stock and not self._signals_fired[self.SIG_GAP_REVERSAL]:
             f, d = self._check_gap_reversal()
             if f:
                 self._signals_fired[self.SIG_GAP_REVERSAL] = True
                 return True, self.SIG_GAP_REVERSAL, d
 
-        if not self._signals_fired[self.SIG_TREND_RIDE]:
+        # ── Signal 2: Trend Ride (gap stocks only, direction must align with gap) ──
+        # A gap-up stock trending above VWAP = momentum up → LONG (not SHORT reversal)
+        # A gap-down stock trending below VWAP = momentum down → SHORT
+        # Only fires after reversal signal has already been consumed or missed.
+        if is_gap_stock and not self._signals_fired[self.SIG_TREND_RIDE]:
             f, d = self._check_trend_ride()
             if f:
-                self._signals_fired[self.SIG_TREND_RIDE] = True
-                return True, self.SIG_TREND_RIDE, d
+                # Guard: direction must not contradict the gap thesis
+                gap_bias = "LONG" if self.gap_direction == "GAP_DOWN" else "SHORT"
+                if d == gap_bias or self._signals_fired[self.SIG_GAP_REVERSAL]:
+                    self._signals_fired[self.SIG_TREND_RIDE] = True
+                    return True, self.SIG_TREND_RIDE, d
 
-        if not self._signals_fired[self.SIG_VWAP_BREAKOUT]:
+        # ── Signal 3: VWAP Breakout (gap stocks only) ──────────────────
+        if is_gap_stock and not self._signals_fired[self.SIG_VWAP_BREAKOUT]:
             f, d = self._check_vwap_breakout()
             if f:
                 self._signals_fired[self.SIG_VWAP_BREAKOUT] = True
                 return True, self.SIG_VWAP_BREAKOUT, d
 
-        if (self.gap_direction == "NONE"
-                and not self._signals_fired[self.SIG_TREND_CONTINUATION]):
-            f, d = self._check_trend_continuation()
-            if f:
-                self._signals_fired[self.SIG_TREND_CONTINUATION] = True
-                return True, self.SIG_TREND_CONTINUATION, d
+        # ── Signal 4: Trend Continuation — DISABLED ────────────────────
+        # Non-gap stocks are no longer subscribed via WS, so this signal
+        # will never have data to fire on. Kept in code but permanently
+        # gated to avoid accidental triggering if logic changes later.
 
         return False, "", ""
 
@@ -256,7 +280,16 @@ class VWAPTracker:
         if len(bars) < 20:
             return False, ""
 
-        recent_5  = bars[-5:]
+        # ── Only use WS-sourced bars for slope measurement ──
+        # REST-polled bars repeat the same price at 30s intervals,
+        # which makes slope appear flat even during real moves.
+        # Using them would cause false breakout signals.
+        ws_bars = [b for b in bars if b.from_ws]
+        if len(ws_bars) < 5:
+            # Not enough WS bars yet — skip breakout check entirely
+            return False, ""
+
+        recent_5  = ws_bars[-5:]
         slope_now = self._slope_pct_per_min(recent_5)
 
         breaking_up   = slope_now >  FLAT_SLOPE_THRESHOLD * 3
@@ -412,10 +445,10 @@ class VWAPManager:
         if token:
             self._token_to_tracker.pop(token, None)
 
-    def on_tick(self, token: str, tick: dict):
+    def on_tick(self, token: str, tick: dict, from_ws: bool = True):
         tracker = self._token_to_tracker.get(token)
         if tracker:
-            tracker.on_tick(tick)
+            tracker.on_tick(tick, from_ws=from_ws)
 
     def get_tracker(self, symbol: str) -> Optional[VWAPTracker]:
         token = self._symbol_to_token.get(symbol)

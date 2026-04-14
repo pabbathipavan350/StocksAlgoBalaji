@@ -215,13 +215,17 @@ class TradeManager:
             return False
         if symbol in self._open:
             return False   # already in trade for this symbol
-        # In paper mode — only block if already in this symbol or day stopped
-        # No limit on simultaneous trades or daily trade count
-        if config.PAPER_TRADE:
-            return True
-        # Live mode — enforce all limits
+        # Simultaneous cap enforced in BOTH paper and live mode.
+        # Paper previously skipped this, which caused 38 trades in one session.
         if len(self._open) >= config.MAX_SIMULTANEOUS:
             return False
+        if config.PAPER_TRADE:
+            # In paper mode skip daily-loss guard (it's a simulation)
+            # but still cap total trades so reports stay readable
+            if self.trade_count >= config.MAX_TRADES_PER_DAY:
+                return False
+            return True
+        # Live mode — enforce all limits including daily loss
         if self.trade_count >= config.MAX_TRADES_PER_DAY:
             return False
         if self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:

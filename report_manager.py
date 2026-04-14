@@ -35,7 +35,7 @@ class ReportManager:
             self._writer.writerow([
                 "Date", "Trade#", "Mode",
                 "Entry Time", "Exit Time", "Duration (mins)",
-                "Symbol", "Name", "Direction",
+                "Symbol", "Name", "Signal Type", "Direction",
                 "Gap Direction", "Gap %",
                 "Qty", "Exposure (Rs)",
                 "Entry Price", "Exit Price", "Peak Price",
