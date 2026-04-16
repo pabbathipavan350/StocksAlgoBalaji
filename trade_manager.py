@@ -1,15 +1,15 @@
 # ============================================================
-# TRADE_MANAGER.PY — Position & Order Management
+# TRADE_MANAGER.PY — v3 Position & Order Management
 # ============================================================
-# Manages up to MAX_SIMULTANEOUS open equity intraday trades.
 #
-# Per trade:
-#   - Capital allocation: Rs 25,000 per trade
-#   - Intraday leverage: 4x (so buying power = Rs 1,00,000)
-#   - SL: 0.5% from entry
-#   - Trail: activates at +1%, SL ratchets to peak - 0.5%
-#   - Hard target: 2.5%
-#   - Paper mode: simulated fills, full P&L log
+# KEY CHANGES FROM v2:
+#   1. Trade budget split: 5 TREND slots + 3 OTHER slots
+#      Prevents early GAP_REVERSAL losses from blocking TREND entries
+#   2. VWAP-anchored SL for GAP_REVERSAL
+#      SL placed at VWAP + buffer (not fixed %) — if price returns to VWAP,
+#      thesis is invalidated, exit immediately
+#   3. Intraday volume check before entry (delegated to VWAPTracker)
+#   4. SL widened to 0.8% (was 0.5%) — survive normal noise
 # ============================================================
 
 import logging
@@ -26,28 +26,18 @@ def now_ist() -> datetime.datetime:
 
 
 def calc_qty(entry_price: float) -> int:
-    """
-    Calculate share quantity for Rs 25,000 allocated capital.
-    With 4x leverage, buying power = Rs 1,00,000.
-    We deploy Rs 25,000 of capital per trade (= 4× = Rs 1,00,000 exposure).
-    """
     if entry_price <= 0:
         return 1
-    exposure = config.CAPITAL_PER_TRADE * config.LEVERAGE   # Rs 1,00,000
+    exposure = config.CAPITAL_PER_TRADE * config.LEVERAGE
     qty      = int(exposure / entry_price)
     return max(1, qty)
 
 
 def calc_trade_cost(entry: float, exit_p: float, qty: int, side: str) -> float:
-    """
-    Calculate approximate transaction costs for equity intraday.
-    side: 'LONG' or 'SHORT'
-    """
     turnover  = (entry + exit_p) * qty
     buy_val   = entry  * qty
     sell_val  = exit_p * qty
-
-    stt       = sell_val * config.STT_INTRADAY_PCT   # STT on sell side
+    stt       = sell_val * config.STT_INTRADAY_PCT
     txn       = turnover * config.EXCHANGE_TXN_PCT
     sebi      = turnover * config.SEBI_PCT
     stamp     = buy_val  * config.STAMP_DUTY_PCT
@@ -64,13 +54,14 @@ class Trade:
 
     def __init__(self, symbol: str, token: str, direction: str,
                  entry_price: float, entry_time: datetime.datetime,
-                 entry_vwap: float, gap_pct: float, gap_direction: str, signal_type: str = "GAP_REVERSAL"):
+                 entry_vwap: float, gap_pct: float, gap_direction: str,
+                 signal_type: str = "GAP_REVERSAL"):
         Trade._id_counter += 1
         self.trade_id      = Trade._id_counter
         self.symbol        = symbol
         self.token         = token
-        self.direction     = direction          # 'LONG' or 'SHORT'
-        self.gap_direction = gap_direction      # 'GAP_UP' or 'GAP_DOWN'
+        self.direction     = direction
+        self.gap_direction = gap_direction
         self.gap_pct       = gap_pct
         self.signal_type   = signal_type
         self.entry_price   = entry_price
@@ -79,32 +70,54 @@ class Trade:
         self.qty           = calc_qty(entry_price)
         self.exposure      = round(entry_price * self.qty, 2)
 
-        # SL & Target
-        sl_offset          = entry_price * (config.SL_PCT / 100.0)
-        tgt_offset         = entry_price * (config.TARGET_PCT / 100.0)
+        # ── SL & Target ────────────────────────────────────
+        # VWAP_TREND: place SL just beyond VWAP (VWAP break = thesis broken)
+        # GAP_REVERSAL: place SL at VWAP + small buffer
+        # Others: fixed SL %
 
+        is_trend  = signal_type in ("VWAP_TREND_LONG", "VWAP_TREND_SHORT")
+        is_reversal = signal_type == "GAP_REVERSAL"
+        vwap_sl_buf = entry_vwap * (getattr(config, "GAP_REVERSAL_SL_BUFFER", 0.2) / 100)
+
+        if is_trend or is_reversal:
+            # SL anchored to VWAP at entry time
+            if direction == "LONG":
+                self.sl_price = round(entry_vwap - vwap_sl_buf, 2)
+            else:  # SHORT
+                self.sl_price = round(entry_vwap + vwap_sl_buf, 2)
+        else:
+            # Fixed % SL for VWAP_BREAKOUT
+            sl_offset = entry_price * (config.SL_PCT / 100.0)
+            if direction == "LONG":
+                self.sl_price = round(entry_price - sl_offset, 2)
+            else:
+                self.sl_price = round(entry_price + sl_offset, 2)
+
+        # Ensure SL is at least 0.3% away from entry (avoid immediate stop)
+        min_sl_distance = entry_price * 0.003
         if direction == "LONG":
-            self.sl_price     = round(entry_price - sl_offset,  2)
+            self.sl_price = min(self.sl_price, entry_price - min_sl_distance)
+        else:
+            self.sl_price = max(self.sl_price, entry_price + min_sl_distance)
+
+        tgt_offset = entry_price * (config.TARGET_PCT / 100.0)
+        if direction == "LONG":
             self.target_price = round(entry_price + tgt_offset, 2)
-        else:  # SHORT
-            self.sl_price     = round(entry_price + sl_offset,  2)
+        else:
             self.target_price = round(entry_price - tgt_offset, 2)
 
         # Trail state
-        self.peak_price    = entry_price
-        self.trail_active  = False
+        self.peak_price   = entry_price
+        self.trail_active = False
 
         # Exit state
-        self.exit_price    = 0.0
-        self.exit_time     = None
-        self.exit_reason   = ""
-        self.is_open       = True
-
-        # Live LTP
-        self.ltp           = entry_price
+        self.exit_price  = 0.0
+        self.exit_time   = None
+        self.exit_reason = ""
+        self.is_open     = True
+        self.ltp         = entry_price
 
     def update_ltp(self, ltp: float):
-        """Call on every tick for this position. Returns exit_reason if SL/Target hit."""
         if not self.is_open or ltp <= 0:
             return None
 
@@ -114,11 +127,11 @@ class Trade:
         if self.direction == "LONG":
             if ltp > self.peak_price:
                 self.peak_price = ltp
-        else:  # SHORT
+        else:
             if ltp < self.peak_price:
                 self.peak_price = ltp
 
-        # ── Trailing SL update ────────────────────────────
+        # ── Trailing SL ──────────────────────────────────────
         trail_trigger = self.entry_price * (config.TRAIL_TRIGGER_PCT / 100.0)
         trail_buffer  = self.peak_price  * (config.TRAIL_BUFFER_PCT  / 100.0)
 
@@ -129,7 +142,7 @@ class Trade:
                 if new_sl > self.sl_price:
                     self.sl_price    = new_sl
                     self.trail_active = True
-        else:  # SHORT
+        else:
             profit = self.entry_price - ltp
             if profit >= trail_trigger:
                 new_sl = round(self.peak_price + trail_buffer, 2)
@@ -137,13 +150,13 @@ class Trade:
                     self.sl_price    = new_sl
                     self.trail_active = True
 
-        # ── Target check ──────────────────────────────────
+        # ── Target check ──────────────────────────────────────
         if self.direction == "LONG" and ltp >= self.target_price:
             return "Target"
         if self.direction == "SHORT" and ltp <= self.target_price:
             return "Target"
 
-        # ── SL check ─────────────────────────────────────
+        # ── SL check ──────────────────────────────────────────
         if self.direction == "LONG" and ltp <= self.sl_price:
             return "Trail SL" if self.trail_active else "SL"
         if self.direction == "SHORT" and ltp >= self.sl_price:
@@ -191,52 +204,65 @@ class Trade:
 # ──────────────────────────────────────────────────────────
 
 class TradeManager:
-    """
-    Manages all open trades.
-    - Enforces MAX_SIMULTANEOUS limit
-    - Handles paper mode order simulation
-    - Delegates SL/trail/target monitoring to Trade objects
-    """
+    # Slot type constants
+    TREND_SIGNALS = {"VWAP_TREND_LONG", "VWAP_TREND_SHORT"}
+    OTHER_SIGNALS = {"GAP_REVERSAL", "VWAP_BREAKOUT"}
 
     def __init__(self, client, report_manager):
         self.client      = client
         self.report_mgr  = report_manager
-        self._open: Dict[str, Trade]   = {}   # symbol → Trade
+        self._open: Dict[str, Trade]   = {}
         self._closed: list             = []
         self.day_pnl_rs  = 0.0
         self.trade_count = 0
         self.consec_sl   = 0
         self.day_stopped = False
 
-    # ── Entry ─────────────────────────────────────────────
+        # Budget tracking (v3)
+        self._max_trend_slots = getattr(config, "MAX_TREND_SLOTS", 5)
+        self._max_other_slots = getattr(config, "MAX_OTHER_SLOTS", 3)
 
-    def can_enter(self, symbol: str) -> bool:
+    def _count_open_by_type(self) -> tuple:
+        """Returns (trend_count, other_count)."""
+        trend = sum(1 for t in self._open.values()
+                    if t.signal_type in self.TREND_SIGNALS)
+        other = len(self._open) - trend
+        return trend, other
+
+    def can_enter(self, symbol: str, signal_type: str = "GAP_REVERSAL") -> bool:
         if self.day_stopped:
             return False
         if symbol in self._open:
-            return False   # already in trade for this symbol
-        # Simultaneous cap enforced in BOTH paper and live mode.
-        # Paper previously skipped this, which caused 38 trades in one session.
+            return False
         if len(self._open) >= config.MAX_SIMULTANEOUS:
             return False
         if config.PAPER_TRADE:
-            # In paper mode skip daily-loss guard (it's a simulation)
-            # but still cap total trades so reports stay readable
             if self.trade_count >= config.MAX_TRADES_PER_DAY:
                 return False
+            # Check slot budget
+            trend_c, other_c = self._count_open_by_type()
+            if signal_type in self.TREND_SIGNALS and trend_c >= self._max_trend_slots:
+                return False
+            if signal_type in self.OTHER_SIGNALS and other_c >= self._max_other_slots:
+                return False
             return True
-        # Live mode — enforce all limits including daily loss
+        # Live mode
         if self.trade_count >= config.MAX_TRADES_PER_DAY:
             return False
         if self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:
+            return False
+        trend_c, other_c = self._count_open_by_type()
+        if signal_type in self.TREND_SIGNALS and trend_c >= self._max_trend_slots:
+            return False
+        if signal_type in self.OTHER_SIGNALS and other_c >= self._max_other_slots:
             return False
         return True
 
     def enter(self, symbol: str, token: str, direction: str,
               ltp: float, vwap: float, gap_pct: float,
-              gap_direction: str, signal_type: str = "GAP_REVERSAL") -> Optional[Trade]:
-        """Open a new trade. Paper: fill at LTP. Live: limit order."""
-        if not self.can_enter(symbol):
+              gap_direction: str,
+              signal_type: str = "GAP_REVERSAL") -> Optional[Trade]:
+        if not self.can_enter(symbol, signal_type):
             return None
 
         entry_price = ltp
@@ -259,28 +285,24 @@ class TradeManager:
         self._open[symbol] = trade
         self.trade_count  += 1
 
+        trend_c, other_c = self._count_open_by_type()
         mode_tag = "[PAPER]" if config.PAPER_TRADE else "[LIVE]"
         emoji    = "📈" if direction == "LONG" else "📉"
+
         print(f"\n{'='*55}")
         print(f"{emoji} {mode_tag} ENTRY #{self.trade_count} — {direction} {symbol}  [{signal_type}]")
-        print(f"   Signal    : {signal_type}")
         print(f"   Entry     : ₹{entry_price:.2f}  Qty: {trade.qty}  "
               f"Exposure: ₹{trade.exposure:,.0f}")
         print(f"   VWAP      : ₹{vwap:.2f}")
-        print(f"   SL        : ₹{trade.sl_price:.2f}  ({config.SL_PCT}%)")
+        print(f"   SL        : ₹{trade.sl_price:.2f}  "
+              f"(dist: {abs(entry_price - trade.sl_price)/entry_price*100:.2f}%)")
         print(f"   Target    : ₹{trade.target_price:.2f}  ({config.TARGET_PCT}%)")
         print(f"   Trail     : activates at +{config.TRAIL_TRIGGER_PCT}%")
-        limit_str = "unlimited" if config.PAPER_TRADE else str(config.MAX_SIMULTANEOUS)
-        print(f"   Open      : {len(self._open)}/{limit_str}")
+        print(f"   Slots     : Trend {trend_c}/{self._max_trend_slots}  "
+              f"Other {other_c}/{self._max_other_slots}")
         return trade
 
-    # ── Tick Update ───────────────────────────────────────
-
     def on_tick(self, token: str, ltp: float) -> Optional[str]:
-        """
-        Update all positions with this token's LTP.
-        Returns symbol if exit triggered, else None.
-        """
         for symbol, trade in list(self._open.items()):
             if trade.token != token:
                 continue
@@ -289,8 +311,6 @@ class TradeManager:
                 self.exit(symbol, ltp, reason)
                 return symbol
         return None
-
-    # ── Exit ──────────────────────────────────────────────
 
     def exit(self, symbol: str, ltp: float, reason: str) -> Optional[Trade]:
         trade = self._open.pop(symbol, None)
@@ -304,13 +324,11 @@ class TradeManager:
         trade.close(exit_price, reason)
         self._closed.append(trade)
 
-        # Update day counters
         net = trade.net_pnl
         self.day_pnl_rs += net
         is_sl = reason in ("SL", "Trail SL")
         self.consec_sl  = (self.consec_sl + 1) if is_sl else 0
 
-        # Daily loss guard — only enforce in live mode
         if not config.PAPER_TRADE and self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:
             print(f"\n[Guard] Daily loss limit ₹{config.MAX_DAILY_LOSS_RS:,.0f} hit — stopping")
             self.day_stopped = True
@@ -335,27 +353,21 @@ class TradeManager:
         return trade
 
     def square_off_all(self):
-        """Square off all open positions at EOD."""
         for symbol in list(self._open.keys()):
             trade = self._open[symbol]
             print(f"\n[SquareOff] Closing {trade.direction} {symbol} at ₹{trade.ltp:.2f}")
-            self.exit(symbol, trade.ltp, "Square-off 15:15")
+            self.exit(symbol, trade.ltp, "Square-off 15:10")
 
-    # ── Live order helpers ────────────────────────────────
-
-    def _place_limit_order(self, symbol: str, token: str,
-                           direction: str, ltp: float) -> Optional[float]:
-        """Place a limit entry order. Returns fill price or None."""
+    def _place_limit_order(self, symbol, token, direction, ltp):
         txn_type = "B" if direction == "LONG" else "S"
-        # Limit with small buffer for fill assurance
         limit_px = round(ltp * 1.002, 2) if direction == "LONG" else round(ltp * 0.998, 2)
         qty      = calc_qty(ltp)
         try:
             resp = self.client.place_order(
                 exchange_segment = config.CM_SEGMENT,
-                product          = "MIS",        # Intraday
+                product          = "MIS",
                 price            = str(limit_px),
-                order_type       = "L",           # Limit
+                order_type       = "L",
                 quantity         = qty,
                 trading_symbol   = symbol,
                 transaction_type = txn_type,
@@ -367,8 +379,7 @@ class TradeManager:
             logger.error(f"[Order] Entry failed {symbol}: {e}")
             return None
 
-    def _place_exit_order(self, trade: Trade, ltp: float, reason: str) -> Optional[float]:
-        """Place a market exit order."""
+    def _place_exit_order(self, trade, ltp, reason):
         txn_type = "S" if trade.direction == "LONG" else "B"
         try:
             resp = self.client.place_order(
@@ -387,18 +398,17 @@ class TradeManager:
             logger.error(f"[Order] Exit failed {trade.symbol}: {e}")
             return None
 
-    # ── Status ────────────────────────────────────────────
-
     def print_status(self):
         t = now_ist()
-        limit_str = "unlimited" if config.PAPER_TRADE else str(config.MAX_SIMULTANEOUS)
-        print(f"\n[{t.strftime('%H:%M:%S')}] Open: {len(self._open)}/{limit_str}  "
+        trend_c, other_c = self._count_open_by_type()
+        print(f"\n[{t.strftime('%H:%M:%S')}] Open: {len(self._open)}/{config.MAX_SIMULTANEOUS}  "
+              f"Trend:{trend_c}/{self._max_trend_slots}  Other:{other_c}/{self._max_other_slots}  "
               f"Trades today: {self.trade_count}  Day P&L: ₹{self.day_pnl_rs:+,.0f}  "
               f"Consec SL: {self.consec_sl}")
         for sym, trade in self._open.items():
             unreal = trade.unrealised_pnl
             trail_tag = "🔒" if trade.trail_active else ""
-            print(f"  {trade.direction:5s} {sym:15s}  "
+            print(f"  {trade.direction:5s} {sym:15s}  [{trade.signal_type[:12]}]  "
                   f"E=₹{trade.entry_price:.2f}  L=₹{trade.ltp:.2f}  "
                   f"SL=₹{trade.sl_price:.2f}  TGT=₹{trade.target_price:.2f}  "
                   f"Unreal=₹{unreal:+.0f}{trail_tag}")
