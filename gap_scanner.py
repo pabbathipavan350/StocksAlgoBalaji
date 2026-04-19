@@ -558,6 +558,20 @@ class GapScanner:
             pc = self._prev_close.get(sym, 0)
             if pc <= 0:
                 continue
+
+            # B-01 FIX: price filter — skip penny stocks below MIN_PRICE (₹50)
+            # ALLCARGO (₹9.38) passed previously because this check was missing here.
+            # config.MIN_PRICE is checked in the watchlist load but NOT in the
+            # live LTP scan, so stocks whose price dropped below ₹50 after listing
+            # could still appear. This adds the filter at the correct point.
+            if ltp < config.MIN_PRICE:
+                continue
+
+            # Also skip stocks where prev_close itself was below MIN_PRICE
+            # (prevents ratio distortion from very cheap stocks)
+            if pc < config.MIN_PRICE:
+                continue
+
             gap_pct = (ltp - pc) / pc * 100
 
             if gap_pct >= config.MIN_GAP_PCT and gap_pct <= config.MAX_GAP_PCT:
