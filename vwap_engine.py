@@ -97,6 +97,7 @@ class VWAPTracker:
         # Live state
         self.ltp           = 0.0
         self.vwap          = 0.0
+        self._last_ap      = 0.0  # last known exchange VWAP — reused when ap missing
         self.volume_total  = 0.0
         self.was_above     = None
         self.last_tick_ts  = None
@@ -149,9 +150,11 @@ class VWAPTracker:
         self._tick_count += 1
         self._last_from_ws = from_ws
 
-        # ── VWAP: prefer exchange 'atp' field (Kotak Neo WS) ─────
-        atp_raw = (tick.get("atp") or tick.get("aP") or
-                   tick.get("ap")  or tick.get("avg_price") or 0)
+        # ── VWAP: use exchange 'ap' field (Kotak Neo WS) ────────────
+        # Kotak only sends 'ap' when it changes — if missing, reuse last known value.
+        # Never fall back to self-computed VWAP once we have a real exchange value.
+        atp_raw = (tick.get("ap")  or tick.get("atp") or
+                   tick.get("aP")  or tick.get("avg_price") or 0)
         try:
             ap_val = float(atp_raw)
         except (TypeError, ValueError):
@@ -161,17 +164,21 @@ class VWAPTracker:
         self._bar_tick_vol += tick_vol
 
         if ap_val > 0:
-            # Primary: use exchange VWAP directly (atp from Kotak Neo)
+            # Fresh exchange VWAP received — update and cache it
+            self._last_ap     = ap_val
             self.vwap         = ap_val
             self.volume_total = float(tick.get("v") or tick.get("ttv") or
                                       tick.get("trdVol") or tick.get("vol") or
                                       self.volume_total)
-            # Keep self-compute accumulators in sync so fallback stays accurate
-            if self.volume_total > 0:
-                self._cum_tp_vol = ap_val * self.volume_total
-                self._cum_vol    = self.volume_total
+        elif self._last_ap > 0:
+            # ap missing this tick (unchanged) — reuse last known exchange VWAP
+            self.vwap = self._last_ap
+            vol_raw = float(tick.get("v") or tick.get("ttv") or
+                            tick.get("trdVol") or tick.get("vol") or 0)
+            if vol_raw > 0:
+                self.volume_total = vol_raw
         else:
-            # Fallback: self-compute
+            # No exchange VWAP yet at all — self-compute as seed only
             self._cum_tp_vol += ((high + low + ltp) / 3.0) * tick_vol
             self._cum_vol    += tick_vol
             self.volume_total = self._cum_vol

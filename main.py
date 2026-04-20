@@ -444,7 +444,7 @@ class GapVWAPAlgo:
                         ap_val  = self._extract_ap(item)
                         if ltp_val <= 0:
                             continue
-                        synthetic_tick = {"ltp": ltp_val, "atp": ap_val}
+                        synthetic_tick = {"ltp": ltp_val, "ap": ap_val}
                         self.vwap_mgr.on_tick(tok, synthetic_tick, from_ws=False)
                         self.trade_mgr.on_tick(tok, ltp_val)
                         if self._entries_open and not self.trade_mgr.day_stopped:
@@ -550,7 +550,7 @@ class GapVWAPAlgo:
                                 gap_direction = "NONE",
                             )
 
-                        synthetic_tick = {"ltp": ltp_val, "atp": ap_val}
+                        synthetic_tick = {"ltp": ltp_val, "ap": ap_val}
                         self.vwap_mgr.on_tick(tok, synthetic_tick, from_ws=False)
 
                         if self.trade_mgr.can_enter(symbol, "VWAP_TREND_LONG"):
@@ -591,7 +591,7 @@ class GapVWAPAlgo:
         return 0.0
 
     def _extract_ap(self, item: dict) -> float:
-        for f in ("atp", "ap", "aP", "avg_price"):
+        for f in ("ap", "atp", "aP", "avg_price"):
             v = item.get(f)
             if v and not isinstance(v, dict):
                 try:
