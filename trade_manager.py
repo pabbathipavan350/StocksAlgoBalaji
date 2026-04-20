@@ -237,8 +237,6 @@ class TradeManager:
         if len(self._open) >= config.MAX_SIMULTANEOUS:
             return False
         if config.PAPER_TRADE:
-            if self.trade_count >= config.MAX_TRADES_PER_DAY:
-                return False
             # Check slot budget
             trend_c, other_c = self._count_open_by_type()
             if signal_type in self.TREND_SIGNALS and trend_c >= self._max_trend_slots:
@@ -247,8 +245,6 @@ class TradeManager:
                 return False
             return True
         # Live mode
-        if self.trade_count >= config.MAX_TRADES_PER_DAY:
-            return False
         if self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:
             return False
         trend_c, other_c = self._count_open_by_type()

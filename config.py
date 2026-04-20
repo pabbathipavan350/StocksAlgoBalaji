@@ -27,7 +27,7 @@
 #    Flat VWAP → sudden directional move with volume spike
 #
 # KEY CHANGES FROM v2:
-#   1. MIN_GAP_PCT raised from 3% to 5% — only strong gap stocks
+#   1. MIN_GAP_PCT = 3% — stocks with 3%+ gaps qualify
 #   2. VWAP cross requires 3 bar confirmation (no more wick traps)
 #   3. SL widened from 0.5% to 0.8% — survive normal noise
 #   4. GAP_REVERSAL SL tightened to VWAP level (not fixed %)
@@ -82,8 +82,7 @@ MAX_TREND_SLOTS      = 5         # For VWAP_TREND_LONG / VWAP_TREND_SHORT
 MAX_OTHER_SLOTS      = 3         # For GAP_REVERSAL + VWAP_BREAKOUT
 
 # ── Gap Scanner Settings ───────────────────────────────────
-MIN_GAP_PCT          = 5.0       # RAISED from 3% — only strong gaps qualify
-                                  # Stocks with 5%+ gaps have clearer VWAP trends
+MIN_GAP_PCT          = 3.0       # Stocks with 3%+ gaps qualify
 MAX_GAP_PCT          = 25.0      # Skip extreme circuit moves
 MIN_PREV_VOLUME      = 500_000   # Min previous day volume (liquidity filter)
 MIN_PRICE            = 50.0      # Skip penny stocks
@@ -149,7 +148,6 @@ REST_TREND_INTERVAL  = 60        # Poll full watchlist for trend scan every 60s
                                   # Only need to detect trend — not tick precision
 
 # ── Daily Risk Guards ─────────────────────────────────────
-MAX_TRADES_PER_DAY   = 16
 MAX_DAILY_LOSS_RS    = -10_000
 MAX_CONSEC_SL        = 5         # RAISED from 4 — avoid hair-trigger pauses
 
