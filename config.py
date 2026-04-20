@@ -95,7 +95,8 @@ SCAN_INTERVAL_SECS   = 300       # Rescan every 5 min for new gaps
 VWAP_MIN_TICKS           = 10    # Minimum ticks before any signal fires
 
 # GAP_REVERSAL — the "price crossed VWAP" signal (STRICTER in v3)
-CROSS_BUFFER_PCT         = 0.05  # Buffer for cross detection
+CROSS_BUFFER_PCT         = 0.3   # Entry must be X% from VWAP for gap reversal (allowed range: 0.05 – 0.3)
+CROSS_BUFFER_PCT         = max(0.05, min(0.3, CROSS_BUFFER_PCT))   # Clamp: never below 0.05 or above 0.3
 CROSS_CONFIRM_BARS       = 3     # NEW: require 3 consecutive bars on new side
                                   # This prevents wick trap entries
                                   # v2 entered on the FIRST cross — caused 89% SL rate
@@ -125,13 +126,12 @@ TARGET_PCT           = 3.0       # Hard target 3% (raised from 2.5%)
 # For GAP_REVERSAL specifically — SL is placed just above VWAP at entry
 # (tighter, because VWAP is the thesis — if price goes back above VWAP
 #  after a SHORT reversal, the trade is wrong)
-GAP_REVERSAL_SL_BUFFER = 0.2    # Place SL 0.2% beyond VWAP level at entry
+GAP_REVERSAL_SL_BUFFER = 0.5    # Place SL 0.5% beyond VWAP level at entry
 
 # ── Timing Guards ─────────────────────────────────────────
 MARKET_OPEN          = "09:15"
 ENTRY_START          = "09:30"
-SQUARE_OFF_TIME      = "15:10"
-NO_NEW_ENTRY_TIME    = "15:00"
+SQUARE_OFF_TIME      = "15:18"
 
 # ── VWAP Data Strategy ────────────────────────────────────
 # PRIMARY:   Exchange 'ap' field on WS ticks (most accurate)

@@ -48,7 +48,7 @@ def now_ist() -> datetime.datetime:
 
 # ── Constants (from config with fallback defaults) ─────────
 MIN_TICKS_FOR_SIGNAL  = getattr(config, "VWAP_MIN_TICKS",          10)
-CROSS_BUFFER_PCT      = getattr(config, "CROSS_BUFFER_PCT",         0.05)
+CROSS_BUFFER_PCT      = max(0.05, min(0.3, getattr(config, "CROSS_BUFFER_PCT", 0.05)))  # Clamped: 0.05 – 0.3
 CROSS_CONFIRM_BARS    = getattr(config, "CROSS_CONFIRM_BARS",        3)    # NEW
 TREND_CONFIRM_BARS    = getattr(config, "TREND_CONFIRM_BARS",        15)
 TREND_PULLBACK_PCT    = getattr(config, "TREND_PULLBACK_PCT",        0.4)

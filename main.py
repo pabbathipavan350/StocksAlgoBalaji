@@ -3,14 +3,12 @@
 # ============================================================
 #
 # WHAT'S NEW vs v2:
-#   1. Fixed _entries_open race condition at 15:00
-#      → Added _no_entry_forced flag (one-way latch)
-#   2. REST trend scan loop (every 60s for full watchlist)
+#   1. REST trend scan loop (every 60s for full watchlist)
 #      → Fetches LTP + ap for ALL watchlist stocks via REST batches
 #      → Feeds VWAP_TREND signal detection on stocks not in gap list
 #      → GALLANTT, NETWEB, DEEPAKFERT would have been caught this way
-#   3. Signals context print includes VWAP slope
-#   4. MAX_CONSEC_SL raised to 5 (was 4)
+#   2. Signals context print includes VWAP slope
+#   3. MAX_CONSEC_SL raised to 5 (was 4)
 # ============================================================
 
 import threading
@@ -77,12 +75,10 @@ class GapVWAPAlgo:
 
         self._running        = True
         self._entries_open   = False
-        self._no_entry_forced = False  # FIX v3: one-way latch — once set True, never revert
         self._sq_done        = False
 
         self._entry_open_t   = datetime.time(*map(int, config.ENTRY_START.split(":")))
         self._sq_off_t       = datetime.time(*map(int, config.SQUARE_OFF_TIME.split(":")))
-        self._no_new_entry_t = datetime.time(*map(int, config.NO_NEW_ENTRY_TIME.split(":")))
 
         self._shutdown_time  = now_ist() + datetime.timedelta(hours=5, minutes=50)
         self._last_tick_time  = now_ist()
@@ -647,8 +643,6 @@ class GapVWAPAlgo:
         t = now_ist()
         if self._entries_open:
             entry_tag = "ENTRIES OPEN"
-        elif self._no_entry_forced:
-            entry_tag = f"no new entries (past {config.NO_NEW_ENTRY_TIME})"
         else:
             entry_tag = f"entries open at {config.ENTRY_START}"
         watching  = self.vwap_mgr.active_count
@@ -721,7 +715,6 @@ class GapVWAPAlgo:
                 elif (gap_scanned
                       and last_rescan_time is not None
                       and not sq_done
-                      and not self._no_entry_forced
                       and (t - last_rescan_time).total_seconds() >= config.SCAN_INTERVAL_SECS):
                     should_scan = True
 
@@ -734,7 +727,7 @@ class GapVWAPAlgo:
                         print(f"\n[Main] ✅ ENTRIES NOW OPEN — {t.strftime('%H:%M:%S')} IST")
 
                 # ── Open entries at 9:30 ──────────────────
-                if gap_scanned and not self._entries_open and not self._no_entry_forced:
+                if gap_scanned and not self._entries_open:
                     if t.time() >= self._entry_open_t:
                         self._entries_open = True
                         print(f"\n[Main] ✅ ENTRIES NOW OPEN — {t.strftime('%H:%M:%S')} IST")
@@ -746,8 +739,8 @@ class GapVWAPAlgo:
                         consec_sl_paused           = False
                         consec_sl_resume           = None
                         self.trade_mgr.consec_sl   = 0
-                        # Only re-open if we haven't passed NO_NEW_ENTRY_TIME
-                        if not self._no_entry_forced:
+                        # Re-open entries after consec SL pause lifts
+                        if True:
                             self._entries_open = True
                             print(f"\n[Guard] Consec SL pause lifted — entries re-enabled")
 
@@ -761,22 +754,11 @@ class GapVWAPAlgo:
                     print(f"\n[Guard] {config.MAX_CONSEC_SL} consecutive SLs — "
                           f"pausing entries for 30 min (resume {consec_sl_resume.strftime('%H:%M')})")
 
-                # ── No new entries after 15:00 ──────────
-                # FIX v3: use one-way latch _no_entry_forced
-                # v2 bug: _entries_open was re-opened in a tight loop at 15:00
-                if gap_scanned and not self._no_entry_forced:
-                    if t.time() >= self._no_new_entry_t:
-                        self._no_entry_forced = True  # NEVER goes back to False
-                        self._entries_open    = False
-                        print(f"\n[Main] No new entries after {config.NO_NEW_ENTRY_TIME} — "
-                              f"managing open positions only")
-
                 # ── Square off at 15:10 ───────────────────
                 if t.time() >= self._sq_off_t and not sq_done:
                     print(f"\n[Main] {config.SQUARE_OFF_TIME} — squaring off all positions")
                     self.trade_mgr.square_off_all()
                     self._entries_open = False
-                    self._no_entry_forced = True
                     sq_done            = True
                     self._running      = False
 
