@@ -71,7 +71,7 @@ class GapVWAPAlgo:
         self._gap_up:   list = []
         self._gap_down: list = []
         self._watchlist: Dict[str, dict] = {}  # token → gap stock info
-        self._all_scrips: list = []             # all watchlist scrips for trend scan
+        self._all_scrips: dict = {}             # all watchlist scrips for trend scan (symbol→dict)
 
         self._subscribed_tokens: Set[str] = set()
 
@@ -486,8 +486,9 @@ class GapVWAPAlgo:
                 continue
 
             # Build instrument list from all scrips (excluding already-subscribed gap stocks)
+            # _all_scrips is a dict: symbol -> {token, symbol, ...} — iterate values
             instruments = []
-            for scrip in self._all_scrips:
+            for scrip in (self._all_scrips.values() if isinstance(self._all_scrips, dict) else self._all_scrips):
                 tok = str(scrip.get("token") or scrip.get("instrument_token") or "")
                 if tok and tok not in self._subscribed_tokens:
                     instruments.append({
@@ -527,8 +528,12 @@ class GapVWAPAlgo:
                             continue
 
                         # Find symbol for this token
+                        # _all_scrips is a dict: symbol -> {token, symbol, ...}
                         symbol = None
-                        for scrip in self._all_scrips:
+                        scrips_iter = (self._all_scrips.values()
+                                       if isinstance(self._all_scrips, dict)
+                                       else self._all_scrips)
+                        for scrip in scrips_iter:
                             if str(scrip.get("token")) == tok:
                                 symbol = scrip.get("symbol") or scrip.get("trading_symbol", "")
                                 break
