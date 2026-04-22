@@ -1,8 +1,6 @@
 name: run-algo
 
 on:
-  schedule:
-    - cron: '37 3 * * 1-5'   # 9:07 AM IST
   workflow_dispatch:
 
 jobs:
