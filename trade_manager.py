@@ -168,6 +168,32 @@ class DepthSimulator:
             buy_raw  = depth_raw.get("buy")  or depth_raw.get("bids") or []
             sell_raw = depth_raw.get("sell") or depth_raw.get("asks") or []
 
+            # ── Flat format fallback (Kotak Neo quotes API) ──────────────
+            # Official docs: bid keys = bp/bp1-4 + bq/bq1-4
+            #                ask keys = sp/sp1-4 + bs/bs1-4  (NOT ap/aq)
+            # Levels 1-5: bp1..bp5 / bq1..bq5 / sp1..sp5 / bs1..bs5
+            if not buy_raw and not sell_raw:
+                for i in range(1, 6):
+                    bp = float(item.get(f"bp{i}") or 0)
+                    bq = int(float(item.get(f"bq{i}") or 0))
+                    sp = float(item.get(f"sp{i}") or 0)
+                    bs = int(float(item.get(f"bs{i}") or 0))
+                    if bp > 0:
+                        buy_raw.append({"price": bp, "qty": bq})
+                    if sp > 0:
+                        sell_raw.append({"price": sp, "qty": bs})
+                # Also try level-0 keys (bp/bq/sp/bs without index suffix)
+                if not buy_raw and not sell_raw:
+                    bp0 = float(item.get("bp") or 0)
+                    bq0 = int(float(item.get("bq") or 0))
+                    sp0 = float(item.get("sp") or 0)
+                    bs0 = int(float(item.get("bs") or 0))
+                    if bp0 > 0:
+                        buy_raw.append({"price": bp0, "qty": bq0})
+                    if sp0 > 0:
+                        sell_raw.append({"price": sp0, "qty": bs0})
+            # ─────────────────────────────────────────────────────────────
+
             def parse(raw, desc: bool) -> list:
                 out = []
                 for lvl in raw:
