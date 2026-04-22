@@ -351,7 +351,11 @@ class GapVWAPAlgo:
         if not fired:
             return
 
-        if not self.trade_mgr.can_enter(symbol, sig_type):
+        gap_dir = info.get("direction", "NONE") if info else "NONE"
+
+        if not self.trade_mgr.can_enter(symbol, sig_type,
+                                        gap_direction=gap_dir,
+                                        entry_direction=direction):
             tracker.mark_signal_used(sig_type)
             return
 
@@ -549,7 +553,8 @@ class GapVWAPAlgo:
                         synthetic_tick = {"ltp": ltp_val, "ap": ap_val}
                         self.vwap_mgr.on_tick(tok, synthetic_tick, from_ws=False)
 
-                        if self.trade_mgr.can_enter(symbol, "VWAP_TREND_LONG"):
+                        if self.trade_mgr.can_enter(symbol, "VWAP_TREND_LONG",
+                                                    gap_direction="NONE"):
                             self._check_entry_signal(tok, ltp_val)
 
                         scanned += 1
@@ -648,7 +653,7 @@ class GapVWAPAlgo:
         watching  = self.vwap_mgr.active_count
         print(f"\n[{t.strftime('%H:%M:%S')}] "
               f"Watching: {watching}  "
-              f"Open trades: {len(self.trade_mgr._open)}/{config.MAX_SIMULTANEOUS}  "
+              f"Open trades: {len(self.trade_mgr._open)}  "
               f"Day P&L: ₹{self.trade_mgr.day_pnl_rs:+,.0f}  "
               f"[{entry_tag}]")
         if self.trade_mgr._open:

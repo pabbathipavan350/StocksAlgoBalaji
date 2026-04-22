@@ -73,20 +73,20 @@ KOTAK_ENVIRONMENT     = os.getenv("KOTAK_ENVIRONMENT",     "prod")
 TOTAL_CAPITAL        = 200_000   # Rs 2,00,000 real capital
 LEVERAGE             = 4         # 4x intraday leverage
 CAPITAL_PER_TRADE    = 25_000    # Rs 25,000 per trade (buying power)
-MAX_SIMULTANEOUS     = 8         # Max 8 trades open at once
 
-# Trade budget split (must sum to MAX_SIMULTANEOUS):
-#   TREND signals get 5 slots — the primary edge
-#   REVERSAL + BREAKOUT share 3 slots
-MAX_TREND_SLOTS      = 5         # For VWAP_TREND_LONG / VWAP_TREND_SHORT
-MAX_OTHER_SLOTS      = 3         # For GAP_REVERSAL + VWAP_BREAKOUT
+# ── Per-type concurrent trade limits (no combined cap) ────
+# Each signal type runs independently up to its own limit.
+# Removing MAX_SIMULTANEOUS lets TREND trades run freely
+# without being blocked by OTHER trades and vice versa.
+MAX_TREND_SLOTS      = 8         # VWAP_TREND_LONG / VWAP_TREND_SHORT
+MAX_OTHER_SLOTS      = 8         # GAP_REVERSAL / VWAP_BREAKOUT
 
 # ── Gap Scanner Settings ───────────────────────────────────
 MIN_GAP_PCT          = 3.0       # Stocks with 3%+ gaps qualify
 MAX_GAP_PCT          = 25.0      # Skip extreme circuit moves
 MIN_PREV_VOLUME      = 500_000   # Min previous day volume (liquidity filter)
 MIN_PRICE            = 50.0      # Skip penny stocks
-MIN_INTRADAY_VOLUME  = 100_000   # NEW: min shares traded since 9:15 before entry
+MIN_INTRADAY_VOLUME  = 100_000   # Min shares traded since 9:15 before entry
                                   # Filters thin stocks where VWAP is unreliable
 SCAN_BATCH_SIZE      = 50
 SCAN_INTERVAL_SECS   = 300       # Rescan every 5 min for new gaps
@@ -147,6 +147,13 @@ REST_POLL_INTERVAL   = 15        # Poll gap stocks every 15s (was 30s)
 REST_TREND_INTERVAL  = 60        # Poll full watchlist for trend scan every 60s
                                   # Only need to detect trend — not tick precision
 
+# ── v4 Guards ─────────────────────────────────────────────
+# GAP_DIRECTION_LOCK: GAP_UP stocks → SHORT entries only
+#                     GAP_DOWN stocks → LONG entries only
+# Prevents algo from going LONG on a stock that just gapped up
+# (which is betting against the gap-fill thesis entirely)
+GAP_DIRECTION_LOCK   = True
+
 # ── Daily Risk Guards ─────────────────────────────────────
 MAX_DAILY_LOSS_RS    = -10_000
 MAX_CONSEC_SL        = 5         # RAISED from 4 — avoid hair-trigger pauses
@@ -157,6 +164,20 @@ MAX_CONSEC_SL        = 5         # RAISED from 4 — avoid hair-trigger pauses
 # Filtered: ISIN starts INE (real equity, not ETF/index fund)
 WATCHLIST_MODE       = "file"
 WATCHLIST_FILE       = "watchlist.csv"
+
+# ── Paper Trade Realism ───────────────────────────────────
+# Simulates realistic order book fills in paper mode.
+# When a signal fires, algo fetches live depth and walks the
+# ask/bid levels to compute what a real market order would fill at.
+#
+# PAPER_SLIPPAGE_PCT : fallback fixed slippage when depth fetch fails
+#                      (entry pays more, exit receives less)
+# MAX_BOOK_WALK_PCT  : max % from LTP we allow book walking before we
+#                      stop and accept partial fill at worse avg price.
+#                      Trade is still taken but flagged as THIN_BOOK
+#                      in the log so you can review after 30 days.
+PAPER_SLIPPAGE_PCT   = 0.15   # 0.15% per side fallback slippage
+MAX_BOOK_WALK_PCT    = 0.5    # walk up to 0.5% deep into the book
 
 # ── Costs (equity intraday) ───────────────────────────────
 BROKERAGE_PCT        = 0.0

@@ -337,6 +337,149 @@ class OrderManager:
             logger.warning(f"[Order] Cancel failed {order_id}: {e}")
 
     # ─────────────────────────────────────────────────────
+    #  SL-M Order — place, modify, cancel  (LIVE MODE ONLY)
+    # ─────────────────────────────────────────────────────
+    #
+    #  WHY SL-M not SL-L:
+    #  Gap stocks move fast. A SL-L (stop limit) may not fill if
+    #  price gaps through the limit level — leaving you unprotected
+    #  with a growing loss. SL-M guarantees exit the moment trigger
+    #  is hit, at whatever market price is available.
+    #
+    #  FLOW:
+    #  1. After entry fill confirmed → place_sl_order()
+    #     Places SL-M at trade.sl_price as trigger.
+    #     Returns sl_order_id stored on Trade object.
+    #
+    #  2. When trail SL moves up → modify_sl_order()
+    #     Modifies the existing SL order trigger to new sl_price.
+    #     Kotak Neo: modify_order() with new trigger_price.
+    #     If modify fails → cancel + replace (fallback).
+    #
+    #  3. Before profit exit → cancel_sl_order()
+    #     Must cancel BEFORE placing market exit order.
+    #     If both fire simultaneously, broker rejects one as
+    #     "position already closed" — creates reconciliation mess.
+    # ─────────────────────────────────────────────────────
+
+    def place_sl_order(self, symbol: str, token: str, direction: str,
+                       qty: int, sl_price: float) -> str:
+        """
+        Places a SL-M order on the exchange immediately after entry.
+        Returns the sl_order_id string, or "" on failure.
+
+        direction = direction of the TRADE (not the SL order)
+        LONG trade  → SL fires when price FALLS → txn_type = SELL
+        SHORT trade → SL fires when price RISES → txn_type = BUY
+        """
+        txn_type = "S" if direction == "LONG" else "B"
+        trigger  = str(round(sl_price, 2))
+
+        logger.info(f"[SLOrder] Placing SL-M {txn_type} {symbol}  "
+                    f"qty={qty}  trigger={trigger}")
+        try:
+            resp = self.client.place_order(
+                exchange_segment  = config.CM_SEGMENT,
+                product           = "MIS",
+                price             = "0",          # SL-M — no limit price
+                order_type        = "SL-M",
+                quantity          = qty,
+                trading_symbol    = symbol,
+                transaction_type  = txn_type,
+                instrument_token  = token,
+                trigger_price     = trigger,
+            )
+            order_id = self._extract_order_id(resp)
+            if order_id:
+                logger.info(f"[SLOrder] ✅ SL-M placed — id={order_id}  "
+                            f"{symbol}  trigger=₹{trigger}")
+                return order_id
+            else:
+                logger.error(f"[SLOrder] No order_id in response: {resp}")
+                return ""
+        except Exception as e:
+            logger.error(f"[SLOrder] place_sl_order failed {symbol}: {e}")
+            return ""
+
+    def modify_sl_order(self, sl_order_id: str, symbol: str, token: str,
+                        direction: str, qty: int,
+                        new_sl_price: float) -> str:
+        """
+        Modifies the trigger price of an existing SL-M order.
+        Called every time trail SL moves up.
+
+        Returns new sl_order_id (may change after modify on some brokers).
+        Returns "" if modify failed — caller should treat existing id as valid
+        and log a warning (old SL still protects, just not at latest trail level).
+
+        Strategy:
+          1. Try modify_order() first (cheaper, single API call)
+          2. If modify fails → cancel + replace (guaranteed update)
+        """
+        txn_type    = "S" if direction == "LONG" else "B"
+        new_trigger = str(round(new_sl_price, 2))
+
+        logger.info(f"[SLOrder] Modifying SL-M {symbol}  "
+                    f"id={sl_order_id}  new_trigger=₹{new_trigger}")
+        try:
+            resp = self.client.modify_order(
+                order_id      = sl_order_id,
+                price         = "0",
+                order_type    = "SL-M",
+                quantity      = qty,
+                trigger_price = new_trigger,
+            )
+            new_id = self._extract_order_id(resp) or sl_order_id
+            logger.info(f"[SLOrder] ✅ SL-M modified — id={new_id}  "
+                        f"{symbol}  trigger=₹{new_trigger}")
+            return new_id
+
+        except Exception as e:
+            logger.warning(f"[SLOrder] modify_order failed {symbol}, "
+                           f"trying cancel+replace: {e}")
+            # Fallback: cancel existing, place fresh SL-M
+            self._cancel_order(sl_order_id, symbol, "modify_fallback")
+            new_id = self.place_sl_order(symbol, token, direction,
+                                         qty, new_sl_price)
+            if new_id:
+                logger.info(f"[SLOrder] ✅ SL-M cancel+replace done  "
+                            f"id={new_id}  {symbol}  trigger=₹{new_trigger}")
+            else:
+                logger.error(f"[SLOrder] ❌ cancel+replace ALSO failed {symbol}  "
+                             f"— SL protection may be lost! Check broker app.")
+            return new_id
+
+    def cancel_sl_order(self, sl_order_id: str, symbol: str) -> bool:
+        """
+        Cancels the standing SL-M order before placing a profit exit.
+        MUST be called before place_exit() to avoid dual-exit conflict.
+
+        Returns True if cancelled successfully (or already gone).
+        Returns False if cancel failed — caller should still proceed with
+        exit but log a warning so operator can check broker app.
+        """
+        if not sl_order_id:
+            return True   # nothing to cancel
+        try:
+            self.client.cancel_order(order_id=sl_order_id)
+            logger.info(f"[SLOrder] ✅ SL-M cancelled before profit exit  "
+                        f"id={sl_order_id}  {symbol}")
+            return True
+        except Exception as e:
+            # Common case: SL already triggered by exchange (race condition)
+            # In that case position is already flat — exit will fail too,
+            # which is fine. Log it and let trade_manager handle.
+            err = str(e).lower()
+            if any(x in err for x in ("not found", "invalid", "already",
+                                       "cancelled", "completed")):
+                logger.info(f"[SLOrder] SL order already gone (triggered/cancelled) "
+                            f"id={sl_order_id}  {symbol}: {e}")
+                return True   # treat as success — position is flat
+            logger.error(f"[SLOrder] cancel_sl_order failed {symbol}  "
+                         f"id={sl_order_id}: {e}")
+            return False
+
+    # ─────────────────────────────────────────────────────
     #  Helpers
     # ─────────────────────────────────────────────────────
 
