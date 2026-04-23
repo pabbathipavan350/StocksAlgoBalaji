@@ -80,6 +80,18 @@ class GapVWAPAlgo:
         self._entry_open_t   = datetime.time(*map(int, config.ENTRY_START.split(":")))
         self._sq_off_t       = datetime.time(*map(int, config.SQUARE_OFF_TIME.split(":")))
 
+        # EARLY_TREND timing
+        self._early_trend_start_t = datetime.time(
+            *map(int, getattr(config, "EARLY_TREND_ENTRY_START", "09:20").split(":")))
+        self._early_trend_stop_t  = datetime.time(
+            *map(int, getattr(config, "EARLY_TREND_ENTRY_STOP",  "10:00").split(":")))
+        self._early_trend_open    = False   # True between 9:20 and 10:00
+        # token → {symbol, prev_close, gap_pct, direction}
+        self._early_trend_universe: Dict[str, dict] = {}
+        # symbol → deque of recent VWAP readings for slope detection
+        # Each entry is a float (vwap value). We keep last N to check rising/falling.
+        self._early_vwap_history: Dict[str, list] = {}
+
         self._shutdown_time  = now_ist() + datetime.timedelta(hours=5, minutes=50)
         self._last_tick_time  = now_ist()
         self._circuit_alerted = False
@@ -103,6 +115,15 @@ class GapVWAPAlgo:
         print(f"  Slots    : Trend {config.MAX_TREND_SLOTS} | Other {config.MAX_OTHER_SLOTS}")
         print(f"  Confirm  : {config.CROSS_CONFIRM_BARS} bars for reversal  "
               f"| {config.TREND_MIN_CANDLES_ONSIDE} bars for trend")
+        et_start = getattr(config, "EARLY_TREND_ENTRY_START", "09:20")
+        et_stop  = getattr(config, "EARLY_TREND_ENTRY_STOP",  "10:00")
+        et_slots = getattr(config, "EARLY_TREND_MAX_SLOTS",   8)
+        print(f"  EarlyTrend: gap≥{getattr(config,'EARLY_TREND_MIN_GAP_PCT',2)}%  "
+              f"price≥Rs{getattr(config,'EARLY_TREND_MIN_PRICE',300):.0f}  "
+              f"SL {getattr(config,'EARLY_TREND_SL_PCT',0.7)}%  "
+              f"Tgt {getattr(config,'EARLY_TREND_TARGET_PCT',1.5)}%  "
+              f"window {et_start}–{et_stop}  "
+              f"max {et_slots} slots")
         print("=" * 60)
 
         self._shutdown_time = now_ist() + datetime.timedelta(hours=5, minutes=50)
@@ -247,6 +268,12 @@ class GapVWAPAlgo:
                 target=self._rest_trend_scan_loop,
                 daemon=True,
                 name="RESTTrendScanner"
+            ).start()
+            # Start EARLY_TREND scan (every 10s, 9:15–10:00 AM window)
+            threading.Thread(
+                target=self._early_trend_scan_loop,
+                daemon=True,
+                name="EarlyTrendScanner"
             ).start()
 
         if is_first_scan:
@@ -566,6 +593,308 @@ class GapVWAPAlgo:
             except Exception as e:
                 self.logger.warning(f"[TrendScan] Error: {e}")
 
+    # ── EARLY_TREND scan loop (9:15–10:00, every 10s) ────
+
+    def _early_trend_scan_loop(self):
+        """
+        EARLY_TREND STRATEGY — runs independently of the main gap strategy.
+
+        WHAT IT DOES:
+          From 9:15 AM, scans ALL watchlist stocks every 10 seconds.
+          Filters for stocks with ≥2% gap (up or down) AND price ≥ Rs300.
+          Tracks VWAP for each qualifying stock.
+          When VWAP shows 3 consecutive rising bars (gap-up) or 3 consecutive
+          falling bars (gap-down), AND price pulls back into VWAP ± 0.2%,
+          enters in the direction of the gap:
+            - GAP_UP  → LONG (ride the uptrend)
+            - GAP_DOWN → SHORT (ride the downtrend)
+          SL: 0.7% fixed. Target: 1.5% fixed. No trailing stop.
+          Entries stop at 10:00 AM. Open positions managed until normal sq-off.
+          Max 8 EARLY_TREND trades open simultaneously.
+
+        WHY SEPARATE FROM MAIN STRATEGY:
+          The main strategy entry window is 9:30 AM.
+          This strategy exploits the 9:15–9:20 window where strong
+          trending stocks establish their VWAP direction before entry opens.
+          Different SL/target (tighter) suited to early morning volatility.
+        """
+        # Wait until market opens
+        while self._running:
+            t = now_ist()
+            market_open = datetime.time(9, 15)
+            if t.time() >= market_open:
+                break
+            time.sleep(1)
+
+        print("[EarlyTrend] Scan loop started — every 10s  "
+              "filter: gap≥2%, price≥Rs300, VWAP rising/falling")
+
+        # Build token→symbol reverse map for fast lookup
+        # _all_scrips: symbol → {token, symbol, ...}
+        token_to_symbol: Dict[str, str] = {}
+        scrips_iter = (self._all_scrips.values()
+                       if isinstance(self._all_scrips, dict)
+                       else self._all_scrips)
+        for scrip in scrips_iter:
+            tok = str(scrip.get("token") or scrip.get("instrument_token") or "")
+            sym = scrip.get("symbol") or scrip.get("trading_symbol") or ""
+            if tok and sym:
+                token_to_symbol[tok] = sym.upper()
+
+        # We need prev_close to compute gap %.
+        # Wait for the gap scanner to have prev_close data (it loads at first scan).
+        # We re-use gap_scanner._prev_close once available.
+        scan_interval = getattr(config, "EARLY_TREND_SCAN_INTERVAL", 10)
+        min_gap       = getattr(config, "EARLY_TREND_MIN_GAP_PCT",    2.0) / 100.0
+        min_price     = getattr(config, "EARLY_TREND_MIN_PRICE",      300.0)
+        vwap_bars_req = getattr(config, "EARLY_TREND_VWAP_BARS",      3)
+        band_pct      = getattr(config, "EARLY_TREND_BAND_PCT",        0.2) / 100.0
+
+        last_scan_time = None
+
+        while self._running:
+            time.sleep(0.5)   # tight loop, check every 0.5s
+            if not self._running:
+                break
+
+            t = now_ist()
+
+            # Only scan between 9:15 and 10:00
+            if t.time() < datetime.time(9, 15):
+                continue
+            if t.time() >= self._early_trend_stop_t:
+                # After 10:00 — stop new entries but keep monitoring open trades
+                self._early_trend_open = False
+                # No more scanning needed for entries
+                break
+
+            # Entry window gate (9:20–10:00)
+            self._early_trend_open = (t.time() >= self._early_trend_start_t)
+
+            # Respect scan interval
+            if last_scan_time and (t - last_scan_time).total_seconds() < scan_interval:
+                continue
+            last_scan_time = t
+
+            # Need prev_close data — if gap_scanner doesn't have it yet, skip
+            if not self.gap_scanner or not self.gap_scanner._prev_close:
+                continue
+
+            prev_close_map = self.gap_scanner._prev_close  # symbol → float
+
+            # Build instrument list — all scrips with prev_close
+            instruments = []
+            scrips_iter2 = (self._all_scrips.values()
+                            if isinstance(self._all_scrips, dict)
+                            else self._all_scrips)
+            for scrip in scrips_iter2:
+                tok = str(scrip.get("token") or
+                          scrip.get("instrument_token") or "")
+                sym = (scrip.get("symbol") or
+                       scrip.get("trading_symbol") or "").upper()
+                if not tok or not sym:
+                    continue
+                if sym not in prev_close_map:
+                    continue
+                instruments.append({
+                    "instrument_token": tok,
+                    "exchange_segment": config.CM_SEGMENT,
+                    "_symbol"         : sym,
+                })
+
+            if not instruments:
+                continue
+
+            try:
+                for i in range(0, len(instruments), 50):
+                    if not self._running:
+                        break
+                    batch = instruments[i:i+50]
+                    inst_batch = [{"instrument_token": x["instrument_token"],
+                                   "exchange_segment": x["exchange_segment"]}
+                                  for x in batch]
+                    try:
+                        resp  = self.client.quotes(
+                            instrument_tokens=inst_batch,
+                            quote_type="ltp",
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"[EarlyTrend] quotes error: {e}")
+                        continue
+
+                    items = []
+                    if isinstance(resp, dict):
+                        items = resp.get("data", resp.get("success", []))
+                    elif isinstance(resp, list):
+                        items = resp
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        tok = str(item.get("instrument_token") or
+                                  item.get("tk") or item.get("token") or "")
+                        if not tok:
+                            continue
+
+                        ltp_val = self._extract_ltp(item)
+                        ap_val  = self._extract_ap(item)
+                        if ltp_val <= 0:
+                            continue
+
+                        # Price filter
+                        if ltp_val < min_price:
+                            continue
+
+                        sym = token_to_symbol.get(tok)
+                        if not sym:
+                            continue
+
+                        pc = prev_close_map.get(sym, 0)
+                        if pc <= 0:
+                            continue
+
+                        gap = (ltp_val - pc) / pc   # signed
+
+                        # Gap filter
+                        if abs(gap) < min_gap:
+                            continue
+
+                        direction = "LONG" if gap > 0 else "SHORT"
+
+                        # Register in universe
+                        if tok not in self._early_trend_universe:
+                            self._early_trend_universe[tok] = {
+                                "symbol"   : sym,
+                                "token"    : tok,
+                                "gap_pct"  : round(gap * 100, 2),
+                                "direction": "GAP_UP" if gap > 0 else "GAP_DOWN",
+                                "prev_close": pc,
+                            }
+                            self._early_vwap_history[tok] = []
+
+                        # Feed tick to VWAP engine for tracking
+                        synthetic = {"ltp": ltp_val, "ap": ap_val}
+                        self.vwap_mgr.on_tick(tok, synthetic, from_ws=False)
+
+                        # Ensure tracker exists
+                        if not self.vwap_mgr.get_tracker(sym):
+                            self.vwap_mgr.add_stock(
+                                symbol        = sym,
+                                token         = tok,
+                                gap_direction = self._early_trend_universe[tok]["direction"],
+                            )
+                            self.vwap_mgr.on_tick(tok, synthetic, from_ws=False)
+
+                        tracker = self.vwap_mgr.get_tracker(sym)
+                        if not tracker or tracker.vwap <= 0:
+                            continue
+
+                        # Track VWAP history for slope detection
+                        hist = self._early_vwap_history.setdefault(tok, [])
+                        hist.append(tracker.vwap)
+                        # Keep only last vwap_bars_req + 1 values
+                        if len(hist) > vwap_bars_req + 2:
+                            hist.pop(0)
+
+                        # Check EARLY_TREND entry conditions
+                        if not self._early_trend_open:
+                            continue   # before 9:20 — build history but don't enter
+                        if self.trade_mgr.day_stopped:
+                            continue
+
+                        # Check existing position in this symbol
+                        if sym in self.trade_mgr._open:
+                            continue
+
+                        # Need enough VWAP history
+                        if len(hist) < vwap_bars_req:
+                            continue
+
+                        # VWAP direction check — last N bars must be
+                        # all rising (LONG) or all falling (SHORT)
+                        recent = hist[-vwap_bars_req:]
+                        if direction == "LONG":
+                            vwap_trending = all(
+                                recent[j] < recent[j+1]
+                                for j in range(len(recent)-1)
+                            )
+                        else:
+                            vwap_trending = all(
+                                recent[j] > recent[j+1]
+                                for j in range(len(recent)-1)
+                            )
+
+                        if not vwap_trending:
+                            continue
+
+                        # Pullback to VWAP zone check: price must be within ±band_pct of VWAP
+                        vwap     = tracker.vwap
+                        dist_pct = abs(ltp_val - vwap) / vwap
+                        if dist_pct > band_pct:
+                            continue
+
+                        # For LONG: price should be at or just above VWAP (pullback)
+                        # For SHORT: price should be at or just below VWAP (bounce)
+                        if direction == "LONG" and ltp_val < vwap * (1 - band_pct):
+                            continue
+                        if direction == "SHORT" and ltp_val > vwap * (1 + band_pct):
+                            continue
+
+                        # Slot check
+                        if not self.trade_mgr.can_enter(
+                                sym, "EARLY_TREND",
+                                gap_direction=self._early_trend_universe[tok]["direction"],
+                                entry_direction=direction):
+                            continue
+
+                        gap_info = self._early_trend_universe[tok]
+
+                        self.logger.info(
+                            f"[EarlyTrend] SIGNAL {direction} {sym}  "
+                            f"ltp={ltp_val:.2f} vwap={vwap:.2f}  "
+                            f"dist={dist_pct*100:.3f}%  "
+                            f"gap={gap_info['gap_pct']:+.2f}%  "
+                            f"vwap_hist={[round(v,2) for v in recent]}"
+                        )
+                        print(f"\n🌅 EARLY_TREND SIGNAL: {direction} {sym}  "
+                              f"LTP Rs{ltp_val:.2f}  VWAP Rs{vwap:.2f}  "
+                              f"dist {dist_pct*100:.3f}%  "
+                              f"gap {gap_info['gap_pct']:+.2f}%")
+
+                        trade = self.trade_mgr.enter(
+                            symbol        = sym,
+                            token         = tok,
+                            direction     = direction,
+                            ltp           = ltp_val,
+                            vwap          = vwap,
+                            gap_pct       = gap_info["gap_pct"],
+                            gap_direction = gap_info["direction"],
+                            signal_type   = "EARLY_TREND",
+                        )
+
+                        if trade:
+                            self.telegram.alert_entry(
+                                symbol    = sym,
+                                direction = direction,
+                                gap_dir   = gap_info["direction"],
+                                entry     = trade.entry_price,
+                                vwap      = vwap,
+                                sl        = trade.sl_price,
+                                target    = trade.target_price,
+                                qty       = trade.qty,
+                                gap_pct   = gap_info["gap_pct"],
+                            )
+
+                    time.sleep(0.1)
+
+            except Exception as e:
+                self.logger.warning(f"[EarlyTrend] scan error: {e}",
+                                    exc_info=True)
+
+        self._early_trend_open = False
+        print("[EarlyTrend] Entry window closed (10:00 AM). "
+              "Open positions continue under normal management.")
+
     # ── Helper: extract LTP + AP from REST response ───────
 
     def _extract_ltp(self, item: dict) -> float:
@@ -650,12 +979,23 @@ class GapVWAPAlgo:
             entry_tag = "ENTRIES OPEN"
         else:
             entry_tag = f"entries open at {config.ENTRY_START}"
-        watching  = self.vwap_mgr.active_count
+
+        et_tag = ""
+        if t.time() < self._early_trend_start_t:
+            et_tag = "  [EarlyTrend: building history]"
+        elif self._early_trend_open:
+            early_open = sum(1 for tr in self.trade_mgr._open.values()
+                             if tr.signal_type == "EARLY_TREND")
+            et_tag = f"  [EarlyTrend: OPEN {early_open}/8]"
+        elif t.time() >= self._early_trend_stop_t:
+            et_tag = "  [EarlyTrend: CLOSED 10:00]"
+
+        watching = self.vwap_mgr.active_count
         print(f"\n[{t.strftime('%H:%M:%S')}] "
               f"Watching: {watching}  "
               f"Open trades: {len(self.trade_mgr._open)}  "
-              f"Day P&L: ₹{self.trade_mgr.day_pnl_rs:+,.0f}  "
-              f"[{entry_tag}]")
+              f"Day P&L: Rs{self.trade_mgr.day_pnl_rs:+,.0f}  "
+              f"[{entry_tag}]{et_tag}")
         if self.trade_mgr._open:
             self.trade_mgr.print_status()
 

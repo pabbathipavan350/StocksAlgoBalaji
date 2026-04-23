@@ -154,6 +154,28 @@ REST_TREND_INTERVAL  = 60        # Poll full watchlist for trend scan every 60s
 # (which is betting against the gap-fill thesis entirely)
 GAP_DIRECTION_LOCK   = True
 
+# ── EARLY_TREND Strategy (9:15–10:00 AM window) ───────────
+#
+# Scans all watchlist stocks every 10s from 9:15 AM.
+# Filters: gap ≥2% (up or down), price ≥ Rs300.
+# Entry: VWAP continuously rising (3 consecutive higher VWAP bars)
+#        + price pulls back into VWAP ± EARLY_ENTRY_BAND_PCT.
+# Entry window: 9:20 AM to 10:00 AM only. No entries after 10:00 AM.
+# Direction: LONG for gap-up stocks, SHORT for gap-down stocks.
+# SL and Target are fixed % — no trailing stop for this strategy.
+# Max 8 open EARLY_TREND trades simultaneously.
+#
+EARLY_TREND_MIN_GAP_PCT    = 2.0    # min gap % to qualify (≥2% up or down)
+EARLY_TREND_MIN_PRICE      = 300.0  # only stocks ≥ Rs300
+EARLY_TREND_ENTRY_START    = "09:20" # no entries before this
+EARLY_TREND_ENTRY_STOP     = "10:00" # no new entries at or after this
+EARLY_TREND_SCAN_INTERVAL  = 10     # REST scan every 10 seconds
+EARLY_TREND_VWAP_BARS      = 3      # need 3 consecutive rising/falling VWAP bars
+EARLY_TREND_BAND_PCT       = 0.2    # entry allowed when price within ±0.2% of VWAP
+EARLY_TREND_SL_PCT         = 0.7    # fixed SL 0.7% from entry
+EARLY_TREND_TARGET_PCT     = 1.5    # fixed target 1.5% from entry
+EARLY_TREND_MAX_SLOTS      = 8      # max 8 open EARLY_TREND trades at once
+
 # ── Daily Risk Guards ─────────────────────────────────────
 MAX_DAILY_LOSS_RS    = -10_000
 MAX_CONSEC_SL        = 5         # RAISED from 4 — avoid hair-trigger pauses

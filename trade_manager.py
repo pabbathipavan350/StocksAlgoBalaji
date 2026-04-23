@@ -260,11 +260,22 @@ class Trade:
         self.exposure     = round(entry_price * self.qty, 2)
 
         # SL calculation
-        is_trend    = signal_type in ("VWAP_TREND_LONG", "VWAP_TREND_SHORT")
-        is_reversal = signal_type == "GAP_REVERSAL"
-        vwap_buf    = entry_vwap * (getattr(config, "GAP_REVERSAL_SL_BUFFER", 0.2) / 100)
+        is_trend       = signal_type in ("VWAP_TREND_LONG", "VWAP_TREND_SHORT")
+        is_reversal    = signal_type == "GAP_REVERSAL"
+        is_early_trend = signal_type == "EARLY_TREND"
+        vwap_buf       = entry_vwap * (getattr(config, "GAP_REVERSAL_SL_BUFFER", 0.2) / 100)
 
-        if is_trend or is_reversal:
+        if is_early_trend:
+            # Fixed % SL and target — no VWAP anchor, no trailing
+            sl_off  = entry_price * (getattr(config, "EARLY_TREND_SL_PCT",     0.7) / 100.0)
+            tgt_off = entry_price * (getattr(config, "EARLY_TREND_TARGET_PCT", 1.5) / 100.0)
+            if direction == "LONG":
+                self.sl_price     = round(entry_price - sl_off,  2)
+                self.target_price = round(entry_price + tgt_off, 2)
+            else:
+                self.sl_price     = round(entry_price + sl_off,  2)
+                self.target_price = round(entry_price - tgt_off, 2)
+        elif is_trend or is_reversal:
             if direction == "LONG":
                 self.sl_price = round(entry_vwap - vwap_buf, 2)
             else:
@@ -276,17 +287,21 @@ class Trade:
             else:
                 self.sl_price = round(entry_price + sl_off, 2)
 
-        min_dist = entry_price * 0.003
-        if direction == "LONG":
-            self.sl_price = min(self.sl_price, entry_price - min_dist)
-        else:
-            self.sl_price = max(self.sl_price, entry_price + min_dist)
+        # Ensure SL is never too close to entry (skip for EARLY_TREND — 0.7% is intentional)
+        if not is_early_trend:
+            min_dist = entry_price * 0.003
+            if direction == "LONG":
+                self.sl_price = min(self.sl_price, entry_price - min_dist)
+            else:
+                self.sl_price = max(self.sl_price, entry_price + min_dist)
 
-        tgt_off = entry_price * (config.TARGET_PCT / 100.0)
-        if direction == "LONG":
-            self.target_price = round(entry_price + tgt_off, 2)
-        else:
-            self.target_price = round(entry_price - tgt_off, 2)
+        # EARLY_TREND already set its own target above — skip default
+        if not is_early_trend:
+            tgt_off = entry_price * (config.TARGET_PCT / 100.0)
+            if direction == "LONG":
+                self.target_price = round(entry_price + tgt_off, 2)
+            else:
+                self.target_price = round(entry_price - tgt_off, 2)
 
         self.peak_price   = entry_price
         self.trail_active = False
@@ -321,20 +336,22 @@ class Trade:
         trail_buffer  = self.peak_price  * (config.TRAIL_BUFFER_PCT  / 100.0)
 
         sl_moved = False
-        if self.direction == "LONG":
-            if (ltp - self.entry_price) >= trail_trigger:
-                new_sl = round(self.peak_price - trail_buffer, 2)
-                if new_sl > self.sl_price:
-                    self.sl_price     = new_sl
-                    self.trail_active = True
-                    sl_moved          = True
-        else:
-            if (self.entry_price - ltp) >= trail_trigger:
-                new_sl = round(self.peak_price + trail_buffer, 2)
-                if new_sl < self.sl_price:
-                    self.sl_price     = new_sl
-                    self.trail_active = True
-                    sl_moved          = True
+        # EARLY_TREND uses fixed SL only — no trailing stop
+        if self.signal_type != "EARLY_TREND":
+            if self.direction == "LONG":
+                if (ltp - self.entry_price) >= trail_trigger:
+                    new_sl = round(self.peak_price - trail_buffer, 2)
+                    if new_sl > self.sl_price:
+                        self.sl_price     = new_sl
+                        self.trail_active = True
+                        sl_moved          = True
+            else:
+                if (self.entry_price - ltp) >= trail_trigger:
+                    new_sl = round(self.peak_price + trail_buffer, 2)
+                    if new_sl < self.sl_price:
+                        self.sl_price     = new_sl
+                        self.trail_active = True
+                        sl_moved          = True
 
         # Target
         if self.direction == "LONG"  and ltp >= self.target_price: return "Target"
@@ -389,8 +406,9 @@ class Trade:
 # ──────────────────────────────────────────────────────────
 
 class TradeManager:
-    TREND_SIGNALS = {"VWAP_TREND_LONG", "VWAP_TREND_SHORT"}
-    OTHER_SIGNALS = {"GAP_REVERSAL", "VWAP_BREAKOUT"}
+    TREND_SIGNALS      = {"VWAP_TREND_LONG", "VWAP_TREND_SHORT"}
+    OTHER_SIGNALS      = {"GAP_REVERSAL", "VWAP_BREAKOUT"}
+    EARLY_TREND_SIGNAL = "EARLY_TREND"
 
     def __init__(self, client, report_manager):
         self.client      = client
@@ -413,8 +431,9 @@ class TradeManager:
         self.consec_sl   = 0
         self.day_stopped = False
 
-        self._max_trend_slots = getattr(config, "MAX_TREND_SLOTS", 5)
-        self._max_other_slots = getattr(config, "MAX_OTHER_SLOTS", 3)
+        self._max_trend_slots       = getattr(config, "MAX_TREND_SLOTS", 5)
+        self._max_other_slots       = getattr(config, "MAX_OTHER_SLOTS", 3)
+        self._max_early_trend_slots = getattr(config, "EARLY_TREND_MAX_SLOTS", 8)
 
     def _count_open_by_type(self) -> tuple:
         trend = sum(1 for t in self._open.values()
@@ -451,6 +470,13 @@ class TradeManager:
             return False
         if signal_type in self.OTHER_SIGNALS and other_c >= self._max_other_slots:
             return False
+
+        # EARLY_TREND has its own independent 8-slot limit
+        if signal_type == self.EARLY_TREND_SIGNAL:
+            early_c = sum(1 for t in self._open.values()
+                          if t.signal_type == self.EARLY_TREND_SIGNAL)
+            if early_c >= self._max_early_trend_slots:
+                return False
 
         if not config.PAPER_TRADE:
             if self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:

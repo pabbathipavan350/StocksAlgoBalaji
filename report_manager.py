@@ -28,6 +28,8 @@ def _log_file_for(signal_type: str) -> str:
         return "reports/trade_log_TREND.csv"
     elif signal_type == "GAP_REVERSAL":
         return "reports/trade_log_GAP_REVERSAL.csv"
+    elif signal_type == "EARLY_TREND":
+        return "reports/trade_log_EARLY_TREND.csv"
     else:
         return "reports/trade_log_BREAKOUT.csv"
 
@@ -61,6 +63,7 @@ class ReportManager:
             "reports/trade_log_TREND.csv",
             "reports/trade_log_GAP_REVERSAL.csv",
             "reports/trade_log_BREAKOUT.csv",
+            "reports/trade_log_EARLY_TREND.csv",
         ):
             self._init_csv(path)
         self._init_daily_history()
@@ -205,9 +208,10 @@ class ReportManager:
         report += f"  Capital Deployed    : Rs{config.TOTAL_CAPITAL:,.0f}\n"
         report += f"  Return on Capital   : {net_pnl/config.TOTAL_CAPITAL*100:+.2f}%\n\n"
         report += f"  BY SIGNAL TYPE  (separate CSVs in reports/)\n  {'─'*56}\n"
-        report += type_stats("VWAP_TREND", ("VWAP_TREND_LONG", "VWAP_TREND_SHORT"))
+        report += type_stats("VWAP_TREND",    ("VWAP_TREND_LONG", "VWAP_TREND_SHORT"))
         report += type_stats("GAP_REVERSAL",  ("GAP_REVERSAL",))
         report += type_stats("VWAP_BREAKOUT", ("VWAP_BREAKOUT",))
+        report += type_stats("EARLY_TREND",   ("EARLY_TREND",))
         report += f"\n  EXIT REASON BREAKDOWN\n  {'─'*56}\n"
         for reason, count in sorted(exits.items()):
             report += f"  {reason:<22}: {count}\n"
@@ -218,6 +222,7 @@ class ReportManager:
             ("VWAP TREND",    ("VWAP_TREND_LONG", "VWAP_TREND_SHORT")),
             ("GAP REVERSAL",  ("GAP_REVERSAL",)),
             ("VWAP BREAKOUT", ("VWAP_BREAKOUT",)),
+            ("EARLY TREND",   ("EARLY_TREND",)),
         ):
             group = [t for t in self.trades
                      if getattr(t, "signal_type", "") in signal_types]
@@ -256,8 +261,8 @@ class ReportManager:
             json.dump(self._history, f, indent=2)
 
         print(f"\n[Report] Daily report saved: {fname}")
-        print(f"[Report] Logs: trade_log_TREND.csv  "
-              f"trade_log_GAP_REVERSAL.csv  trade_log_BREAKOUT.csv")
+        print(f"[Report] Logs: trade_log_TREND.csv  trade_log_GAP_REVERSAL.csv  "
+              f"trade_log_BREAKOUT.csv  trade_log_EARLY_TREND.csv")
         return report
 
     def close(self):
