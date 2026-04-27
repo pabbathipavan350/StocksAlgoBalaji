@@ -92,10 +92,14 @@ class GapVWAPAlgo:
         # Each entry is a float (vwap value). We keep last N to check rising/falling.
         self._early_vwap_history: Dict[str, list] = {}
 
-        self._shutdown_time  = now_ist() + datetime.timedelta(hours=5, minutes=50)
+        self._shutdown_time   = now_ist() + datetime.timedelta(hours=5, minutes=50)
         self._last_tick_time  = now_ist()
         self._circuit_alerted = False
         self._ws_connected    = False
+        # Guard: prevents multiple concurrent WSReconnect threads.
+        # Kotak Neo library fires on_close multiple times during a failed reconnect,
+        # which spawns dozens of threads that all hammer the socket simultaneously.
+        self._ws_reconnecting = False
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT,  self._handle_sigterm)
@@ -174,41 +178,72 @@ class GapVWAPAlgo:
     def _on_ws_close(self, *args):
         self._ws_connected = False
         self.logger.warning("[WS] Closed")
-        if self._running:
-            threading.Thread(
-                target=self._ws_reconnect_loop,
-                daemon=True,
-                name="WSReconnect"
-            ).start()
+        if not self._running:
+            return
+        # Guard: if a reconnect thread is already running, do NOT spawn another.
+        # The Kotak Neo library fires on_close repeatedly during reconnect attempts
+        # (each failed attempt triggers on_close again), which without this guard
+        # creates dozens of concurrent reconnect threads all hammering the socket.
+        if self._ws_reconnecting:
+            self.logger.debug("[WS] Reconnect already in progress — ignoring duplicate close")
+            return
+        self._ws_reconnecting = True
+        threading.Thread(
+            target=self._ws_reconnect_loop,
+            daemon=True,
+            name="WSReconnect"
+        ).start()
 
     def _ws_reconnect_loop(self):
-        delays = [5, 10, 20, 30]
-        for attempt, delay in enumerate(delays, 1):
-            if not self._running:
-                return
-            print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
-            time.sleep(delay)
-            if not self._running:
-                return
-            try:
-                self._setup_websocket()
-                all_tokens = [
-                    {"instrument_token": tok, "exchange_segment": config.CM_SEGMENT}
-                    for tok in self._subscribed_tokens
-                ]
-                if all_tokens:
-                    for i in range(0, len(all_tokens), 50):
-                        self.client.subscribe(
-                            instrument_tokens=all_tokens[i:i+50],
-                            isIndex=False,
-                            isDepth=False,
-                        )
-                        time.sleep(0.5)
-                print(f"[WS] ✅ Reconnected — re-subscribed {len(all_tokens)} tokens")
-                return
-            except Exception as e:
-                self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
-        print("[WS] ❌ All reconnect attempts failed — session manager will handle")
+        # Exponential backoff: 5s, 15s, 30s, 60s
+        # Extra initial sleep gives the dead socket time to fully close
+        # before we attempt to create a new one — prevents "already closed" errors.
+        delays = [5, 15, 30, 60]
+        try:
+            for attempt, delay in enumerate(delays, 1):
+                if not self._running:
+                    return
+                print(f"\n[WS] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+                # Wait the full delay — do NOT try to reconnect before the old
+                # socket is fully torn down. The "already closed" errors happen
+                # when we attempt to open a new socket before the old one is gone.
+                time.sleep(delay)
+                if not self._running:
+                    return
+                try:
+                    self._setup_websocket()
+                    all_tokens = [
+                        {"instrument_token": tok,
+                         "exchange_segment": config.CM_SEGMENT}
+                        for tok in self._subscribed_tokens
+                    ]
+                    if all_tokens:
+                        for i in range(0, len(all_tokens), 50):
+                            self.client.subscribe(
+                                instrument_tokens=all_tokens[i:i+50],
+                                isIndex=False,
+                                isDepth=False,
+                            )
+                            time.sleep(0.5)
+                    print(f"[WS] ✅ Reconnected — re-subscribed {len(all_tokens)} tokens")
+                    self._ws_connected = True
+                    return   # success — guard cleared in finally block
+                except Exception as e:
+                    err = str(e).lower()
+                    # "already closed" / "sock" errors mean the library is still
+                    # tearing down — extend wait and retry
+                    if "closed" in err or "sock" in err or "none" in err:
+                        self.logger.warning(
+                            f"[WS] Socket not ready yet (attempt {attempt}): {e}  "
+                            f"— waiting longer before retry")
+                        extra_wait = delay   # double the wait for socket cleanup
+                        time.sleep(extra_wait)
+                    else:
+                        self.logger.error(f"[WS] Reconnect attempt {attempt} failed: {e}")
+            print("[WS] ❌ All reconnect attempts failed — session manager will handle")
+        finally:
+            # Always clear the guard so a future close event can trigger reconnect again
+            self._ws_reconnecting = False
 
     # ── Gap Scan ─────────────────────────────────────────
 
@@ -391,11 +426,29 @@ class GapVWAPAlgo:
         gap_pct   = info.get("gap_pct", 0.0) if info else 0.0
         gap_dir   = info.get("direction", "NONE") if info else "NONE"
 
+        # ── VWAP proximity gate ──────────────────────────
+        # Only enter when LTP is within ±0.3% of VWAP.
+        # Prevents entries that fire far from VWAP where the
+        # signal may be stale or the stock has already moved too far.
+        entry_band_pct = getattr(config, "ENTRY_VWAP_BAND_PCT", 0.3) / 100.0
+        dist_from_vwap = abs(ltp - vwap) / vwap if vwap > 0 else 999
+        if dist_from_vwap > entry_band_pct:
+            self.logger.debug(
+                f"[ProximityGate] {symbol} {sig_type} REJECTED: "
+                f"LTP Rs{ltp:.2f} is {dist_from_vwap*100:.3f}% from VWAP Rs{vwap:.2f} "
+                f"(max allowed: {entry_band_pct*100:.1f}%)"
+            )
+            # Don't mark signal as used — let it fire again on next tick
+            # when price pulls back closer to VWAP
+            return
+        # ── end proximity gate ───────────────────────────
+
         self.logger.info(f"[Signal] {symbol} {direction} [{sig_type}]  "
-                         f"LTP={ltp:.2f} VWAP={vwap:.2f}  slope={slope:+.4f}%/min")
+                         f"LTP={ltp:.2f} VWAP={vwap:.2f}  slope={slope:+.4f}%/min  "
+                         f"dist={dist_from_vwap*100:.3f}%")
         print(f"\n🔔 SIGNAL: {direction} {symbol}  [{sig_type}]")
-        print(f"   LTP ₹{ltp:.2f}  VWAP ₹{vwap:.2f}  "
-              f"Dist {abs(ltp-vwap)/vwap*100:.2f}%  "
+        print(f"   LTP Rs{ltp:.2f}  VWAP Rs{vwap:.2f}  "
+              f"Dist {dist_from_vwap*100:.3f}% ✅ within {entry_band_pct*100:.1f}%  "
               f"VWAP slope: {slope:+.4f}%/min")
 
         trade = self.trade_mgr.enter(
@@ -618,14 +671,8 @@ class GapVWAPAlgo:
           trending stocks establish their VWAP direction before entry opens.
           Different SL/target (tighter) suited to early morning volatility.
         """
-        # Wait until market opens
-        while self._running:
-            t = now_ist()
-            market_open = datetime.time(9, 15)
-            if t.time() >= market_open:
-                break
-            time.sleep(1)
-
+        # Thread is started from run_gap_scan() which fires at 9:15 market open.
+        # No wait needed — scan starts immediately.
         print("[EarlyTrend] Scan loop started — every 10s  "
               "filter: gap≥2%, price≥Rs300, VWAP rising/falling")
 

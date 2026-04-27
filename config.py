@@ -154,6 +154,13 @@ REST_TREND_INTERVAL  = 60        # Poll full watchlist for trend scan every 60s
 # (which is betting against the gap-fill thesis entirely)
 GAP_DIRECTION_LOCK   = True
 
+# ── Entry VWAP Proximity Gate ─────────────────────────────
+# For GAP_REVERSAL and VWAP_TREND signals, only enter when
+# LTP is within this % of VWAP. Prevents entries that fire
+# far from VWAP where the move has already happened.
+# EARLY_TREND has its own band (EARLY_TREND_BAND_PCT = 0.2%).
+ENTRY_VWAP_BAND_PCT          = 0.3   # ±0.3% of VWAP for main signals
+
 # ── EARLY_TREND Strategy (9:15–10:00 AM window) ───────────
 #
 # Scans all watchlist stocks every 10s from 9:15 AM.

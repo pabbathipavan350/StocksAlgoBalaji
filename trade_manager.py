@@ -456,7 +456,12 @@ class TradeManager:
             return False
 
         # v4 B-04: direction lock
-        if getattr(config, "GAP_DIRECTION_LOCK", True) and entry_direction:
+        # Main strategy: GAP_UP → SHORT only, GAP_DOWN → LONG only (gap fill thesis)
+        # EARLY_TREND: GAP_UP → LONG (trend continuation), GAP_DOWN → SHORT
+        # Direction lock does NOT apply to EARLY_TREND — skip it entirely.
+        if (getattr(config, "GAP_DIRECTION_LOCK", True)
+                and entry_direction
+                and signal_type != self.EARLY_TREND_SIGNAL):
             if gap_direction == "GAP_UP" and entry_direction != "SHORT":
                 logger.debug(f"[DirLock] {symbol}: GAP_UP, reject {entry_direction}")
                 return False
