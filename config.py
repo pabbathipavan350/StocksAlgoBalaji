@@ -62,6 +62,17 @@ _load_env()
 # ── Mode ──────────────────────────────────────────────────
 PAPER_TRADE         = True     # Set False only when ready for live
 
+# ── Signal Flip Mode ──────────────────────────────────────
+# When True: invert every signal direction (BUY→SELL, SELL→BUY).
+# The original SL level becomes the profit target.
+# A fixed Rs cap (FLIP_SL_RS) protects on the downside instead
+# of chasing the original target — caps max loss per trade.
+# Motivation: if the algo is losing consistently, the signal may
+# have reliable directional edge IN REVERSE.
+# Set FLIP_SIGNALS = False to revert to original logic instantly.
+FLIP_SIGNALS        = True     # ← master flip switch
+FLIP_SL_RS          = 900      # Rs fixed SL in flip mode (hard stop per trade)
+
 # ── Kotak Neo Credentials (from .env) ─────────────────────
 KOTAK_CONSUMER_KEY    = os.getenv("KOTAK_CONSUMER_KEY",    "")
 KOTAK_MOBILE_NUMBER   = os.getenv("KOTAK_MOBILE_NUMBER",   "")
@@ -80,6 +91,8 @@ CAPITAL_PER_TRADE    = 25_000    # Rs 25,000 per trade (buying power)
 # without being blocked by OTHER trades and vice versa.
 MAX_TREND_SLOTS      = 8         # VWAP_TREND_LONG / VWAP_TREND_SHORT
 MAX_OTHER_SLOTS      = 8         # GAP_REVERSAL / VWAP_BREAKOUT
+MAX_TOTAL_OPEN_TRADES = 8        # Hard cap: never more than 8 trades running at once
+                                  # across ALL signal types combined
 
 # ── Gap Scanner Settings ───────────────────────────────────
 MIN_GAP_PCT          = 3.0       # Stocks with 3%+ gaps qualify
@@ -131,7 +144,7 @@ GAP_REVERSAL_SL_BUFFER = 0.5    # Place SL 0.5% beyond VWAP level at entry
 # ── Timing Guards ─────────────────────────────────────────
 MARKET_OPEN          = "09:15"
 ENTRY_START          = "09:30"
-SQUARE_OFF_TIME      = "15:18"
+SQUARE_OFF_TIME      = "15:10"
 
 # ── VWAP Data Strategy ────────────────────────────────────
 # PRIMARY:   Exchange 'ap' field on WS ticks (most accurate)
@@ -153,13 +166,6 @@ REST_TREND_INTERVAL  = 60        # Poll full watchlist for trend scan every 60s
 # Prevents algo from going LONG on a stock that just gapped up
 # (which is betting against the gap-fill thesis entirely)
 GAP_DIRECTION_LOCK   = True
-
-# ── Entry VWAP Proximity Gate ─────────────────────────────
-# For GAP_REVERSAL and VWAP_TREND signals, only enter when
-# LTP is within this % of VWAP. Prevents entries that fire
-# far from VWAP where the move has already happened.
-# EARLY_TREND has its own band (EARLY_TREND_BAND_PCT = 0.2%).
-ENTRY_VWAP_BAND_PCT          = 0.3   # ±0.3% of VWAP for main signals
 
 # ── EARLY_TREND Strategy (9:15–10:00 AM window) ───────────
 #

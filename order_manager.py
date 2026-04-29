@@ -57,8 +57,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
-MAX_CONFIRM_WAIT_SECS = 10    # Max seconds to wait for fill confirmation
+MAX_CONFIRM_WAIT_SECS = 7     # FIX-4: reduced from 10s — 10s was hitting rate limits
 POLL_INTERVAL_SECS    = 0.5   # Poll order_report every 0.5 seconds
+POLL_JITTER_SECS      = 0.2   # FIX-4: extra jitter between polls to spread API calls
 MAX_PARTIAL_RETRIES   = 2     # Retry partial fill this many times
 
 
@@ -312,11 +313,11 @@ class OrderManager:
                     )
 
                 # Still OPN (open/pending) — keep polling
-                time.sleep(POLL_INTERVAL_SECS)
+                time.sleep(POLL_INTERVAL_SECS + POLL_JITTER_SECS)
 
             except Exception as e:
                 logger.warning(f"[Order] order_report poll error: {e}")
-                time.sleep(POLL_INTERVAL_SECS)
+                time.sleep(POLL_INTERVAL_SECS + POLL_JITTER_SECS)
 
         # Timed out
         logger.error(f"[Order] {side} TIMEOUT after {MAX_CONFIRM_WAIT_SECS}s  "

@@ -36,6 +36,7 @@
 import logging
 import datetime
 import threading
+import time
 from typing import Dict, Optional, Set
 
 import config
@@ -435,6 +436,10 @@ class TradeManager:
         self._max_other_slots       = getattr(config, "MAX_OTHER_SLOTS", 3)
         self._max_early_trend_slots = getattr(config, "EARLY_TREND_MAX_SLOTS", 8)
 
+        # FIX-7: debounce SL modify — track last modify time per symbol
+        self._last_sl_modify: Dict[str, float] = {}
+        self._SL_MODIFY_DEBOUNCE_SECS = 2.0
+
     def _count_open_by_type(self) -> tuple:
         trend = sum(1 for t in self._open.values()
                     if t.signal_type in self.TREND_SIGNALS)
@@ -446,7 +451,8 @@ class TradeManager:
 
     def can_enter(self, symbol: str, signal_type: str = "GAP_REVERSAL",
                   gap_direction: str = "NONE",
-                  entry_direction: str = "") -> bool:
+                  entry_direction: str = "",
+                  _skip_direction_lock: bool = False) -> bool:
         if self.day_stopped:
             return False
         if symbol in self._open:
@@ -456,10 +462,9 @@ class TradeManager:
             return False
 
         # v4 B-04: direction lock
-        # Main strategy: GAP_UP → SHORT only, GAP_DOWN → LONG only (gap fill thesis)
-        # EARLY_TREND: GAP_UP → LONG (trend continuation), GAP_DOWN → SHORT
-        # Direction lock does NOT apply to EARLY_TREND — skip it entirely.
-        if (getattr(config, "GAP_DIRECTION_LOCK", True)
+        # Skipped in flip mode — we intentionally go against the gap direction.
+        if (not _skip_direction_lock
+                and getattr(config, "GAP_DIRECTION_LOCK", True)
                 and entry_direction
                 and signal_type != self.EARLY_TREND_SIGNAL):
             if gap_direction == "GAP_UP" and entry_direction != "SHORT":
@@ -468,6 +473,13 @@ class TradeManager:
             if gap_direction == "GAP_DOWN" and entry_direction != "LONG":
                 logger.debug(f"[DirLock] {symbol}: GAP_DOWN, reject {entry_direction}")
                 return False
+
+        # Hard cap: total open trades across ALL types must not exceed MAX_TOTAL_OPEN_TRADES
+        max_total = getattr(config, "MAX_TOTAL_OPEN_TRADES", 8)
+        if len(self._open) >= max_total:
+            logger.debug(f"[SlotCap] {symbol} rejected — "
+                         f"{len(self._open)}/{max_total} total slots full")
+            return False
 
         # Per-type slot check — no combined MAX_SIMULTANEOUS cap
         trend_c, other_c = self._count_open_by_type()
@@ -498,14 +510,27 @@ class TradeManager:
               gap_direction: str,
               signal_type: str = "GAP_REVERSAL") -> Optional[Trade]:
 
+        # ── FIX: FLIP SIGNALS ────────────────────────────────────────
+        # When FLIP_SIGNALS is True, invert direction.
+        # The gap_direction lock in can_enter uses the ORIGINAL gap_direction
+        # (already bypassed for flipped entries — see can_enter override).
+        flip_mode = getattr(config, "FLIP_SIGNALS", False)
+        if flip_mode:
+            direction = "SHORT" if direction == "LONG" else "LONG"
+        # ─────────────────────────────────────────────────────────────
+
         with self._entry_lock:
             # Re-check inside lock — state may have changed since outer check
-            if not self.can_enter(symbol, signal_type, gap_direction, direction):
+            # Pass original (pre-flip) gap_direction — direction lock is
+            # intentionally skipped in flip mode (we are going against the gap).
+            if not self.can_enter(symbol, signal_type, gap_direction,
+                                  direction, _skip_direction_lock=flip_mode):
                 return None
 
             fill_quality = "LIVE"
             entry_price  = ltp
             entry_qty    = None
+            actual       = None   # live OrderResult, set below
 
             if config.PAPER_TRADE:
                 # Simulate real fill from live order book
@@ -513,14 +538,36 @@ class TradeManager:
                     symbol, token, direction, calc_qty(ltp), ltp
                 )
             else:
-                actual = self.order_mgr.place_entry(
-                    symbol, token, direction, calc_qty(ltp), ltp
-                )
-                if not actual or not actual.filled:
-                    return None
-                entry_price = actual.avg_price
-                if actual.filled_qty != calc_qty(ltp):
-                    entry_qty = actual.filled_qty
+                # FIX-2: place_entry() called OUTSIDE lock below.
+                # Only do pre-checks here; release lock before the slow network call.
+                pass
+
+        # ── FIX-2: live order placed OUTSIDE _entry_lock ────────────
+        # The lock was held for the full 10-second order confirmation,
+        # blocking all other entry signals. Now we release the lock first,
+        # then place the order, then re-acquire briefly to insert the trade.
+        if not config.PAPER_TRADE:
+            actual = self.order_mgr.place_entry(
+                symbol, token, direction, calc_qty(ltp), ltp
+            )
+            if not actual or not actual.filled:
+                return None
+            entry_price = actual.avg_price
+            if actual.filled_qty != calc_qty(ltp):
+                entry_qty = actual.filled_qty
+
+        with self._entry_lock:
+            # Re-check AGAIN after live order — another thread might have
+            # entered this symbol while we were waiting for fill confirmation.
+            if symbol in self._open:
+                logger.warning(f"[Entry] {symbol} opened by another thread during "
+                               f"order confirmation — discarding duplicate")
+                # We already bought — must exit immediately to stay flat
+                if not config.PAPER_TRADE and actual and actual.filled:
+                    self.order_mgr.place_exit(symbol, token, direction,
+                                              actual.filled_qty, entry_price,
+                                              "duplicate_entry_cleanup")
+                return None
 
             trade = Trade(
                 symbol        = symbol,
@@ -535,10 +582,52 @@ class TradeManager:
                 fill_quality  = fill_quality,
                 override_qty  = entry_qty,
             )
+
+            # ── FLIP MODE: override SL and target ───────────────────
+            # Original SL (the level the original signal would have used)
+            # becomes our profit target.
+            # A fixed Rs amount (FLIP_SL_RS) is our new hard stop.
+            if flip_mode:
+                flip_sl_rs = getattr(config, "FLIP_SL_RS", 900)
+                sl_per_share = flip_sl_rs / max(trade.qty, 1)
+                if direction == "LONG":
+                    # We're now long — stop if price falls below entry - sl_per_share
+                    trade.sl_price     = round(entry_price - sl_per_share, 2)
+                    # Target = the original SL level (which was below entry for a SHORT)
+                    # trade.sl_price was calculated by Trade.__init__ as the ORIGINAL SL
+                    # We need the original SHORT sl_price as our LONG target.
+                    # Original SHORT sl_price = entry_vwap + buffer (for GAP_REVERSAL)
+                    # That is exactly what Trade.__init__ computed before we patch it.
+                    # To get it cleanly: reconstruct using same formula.
+                    vwap_buf = vwap * (getattr(config, "GAP_REVERSAL_SL_BUFFER", 0.2) / 100)
+                    is_trend = signal_type in ("VWAP_TREND_LONG", "VWAP_TREND_SHORT",
+                                               "GAP_REVERSAL", "VWAP_BREAKOUT")
+                    if is_trend:
+                        original_short_sl = round(vwap + vwap_buf, 2)
+                    else:
+                        sl_off = entry_price * (config.SL_PCT / 100.0)
+                        original_short_sl = round(entry_price + sl_off, 2)
+                    trade.target_price = original_short_sl
+                else:
+                    # We're now short — stop if price rises above entry + sl_per_share
+                    trade.sl_price     = round(entry_price + sl_per_share, 2)
+                    vwap_buf = vwap * (getattr(config, "GAP_REVERSAL_SL_BUFFER", 0.2) / 100)
+                    is_trend = signal_type in ("VWAP_TREND_LONG", "VWAP_TREND_SHORT",
+                                               "GAP_REVERSAL", "VWAP_BREAKOUT")
+                    if is_trend:
+                        original_long_sl = round(vwap - vwap_buf, 2)
+                    else:
+                        sl_off = entry_price * (config.SL_PCT / 100.0)
+                        original_long_sl = round(entry_price - sl_off, 2)
+                    trade.target_price = original_long_sl
+                logger.info(f"[FLIP] {symbol} {direction}  "
+                            f"new_sl=₹{trade.sl_price:.2f}  "
+                            f"new_target=₹{trade.target_price:.2f}  "
+                            f"(original SL used as target)")
+            # ────────────────────────────────────────────────────────
+
             self._open[symbol] = trade
             self.trade_count  += 1
-            # Record how many trades were running at the moment this one opened
-            # len(_open) already includes this trade, so subtract 1 for "others open"
             trade.concurrent_at_entry = len(self._open) - 1
 
         # Place SL-M on exchange after entry (live only, outside lock)
@@ -557,22 +646,38 @@ class TradeManager:
                 print(f"\n CRITICAL: SL ORDER FAILED {symbol} "
                       f"SL=Rs{trade.sl_price:.2f} — SET MANUALLY ON BROKER APP!")
 
+            # FIX-3: alert if partial fill cancel failed (logged by order_mgr already,
+            # but operator needs a Telegram push when they're away from terminal)
+            if actual and actual.filled_qty < calc_qty(ltp):
+                from telegram_notifier import TelegramNotifier
+                _tg = getattr(self, "_telegram", None)
+                msg = (f"⚠️ PARTIAL FILL {symbol}: "
+                       f"got {actual.filled_qty}/{calc_qty(ltp)} shares @ "
+                       f"₹{actual.avg_price:.2f}. "
+                       f"Remaining unfilled — check exchange for ghost order.")
+                if _tg:
+                    _tg.alert_risk(msg)
+                logger.warning(f"[PartialFill] {msg}")
+
         trend_c, other_c = self._count_open_by_type()
         mode_tag = "[PAPER]" if config.PAPER_TRADE else "[LIVE]"
+        flip_tag = " [FLIPPED]" if flip_mode else ""
         emoji    = "📈" if direction == "LONG" else "📉"
         fq_tag   = (f"  [{fill_quality}]"
                     if fill_quality not in ("NORMAL", "LIVE") else "")
 
         print(f"\n{'='*55}")
         print(f"{emoji} {mode_tag} ENTRY #{self.trade_count} — "
-              f"{direction} {symbol}  [{signal_type}]{fq_tag}")
+              f"{direction} {symbol}  [{signal_type}]{fq_tag}{flip_tag}")
         print(f"   Entry     : Rs{entry_price:.2f}  "
               f"(signal LTP Rs{ltp:.2f}  slip Rs{abs(entry_price-ltp):.2f})")
         print(f"   Qty       : {trade.qty}  Exposure: Rs{trade.exposure:,.0f}")
         print(f"   VWAP      : Rs{vwap:.2f}")
         print(f"   SL        : Rs{trade.sl_price:.2f}  "
-              f"({abs(entry_price-trade.sl_price)/entry_price*100:.2f}%)")
-        print(f"   Target    : Rs{trade.target_price:.2f}  ({config.TARGET_PCT}%)")
+              f"({abs(entry_price-trade.sl_price)/entry_price*100:.2f}%)"
+              + (" [FIXED Rs STOP]" if flip_mode else ""))
+        print(f"   Target    : Rs{trade.target_price:.2f}"
+              + (" [ORIGINAL SL LEVEL]" if flip_mode else f"  ({config.TARGET_PCT}%)"))
         print(f"   Trail     : activates at +{config.TRAIL_TRIGGER_PCT}%")
         print(f"   Slots     : Trend {trend_c}/{self._max_trend_slots}  "
               f"Other {other_c}/{self._max_other_slots}  "
@@ -600,21 +705,42 @@ class TradeManager:
             if isinstance(result, str) and result.startswith("__SL_MOVED__"):
                 new_sl = float(result.split("__SL_MOVED__")[1])
                 if not config.PAPER_TRADE and trade.sl_order_id:
-                    new_id = self.order_mgr.modify_sl_order(
-                        sl_order_id  = trade.sl_order_id,
-                        symbol       = symbol,
-                        token        = token,
-                        direction    = trade.direction,
-                        qty          = trade.qty,
-                        new_sl_price = new_sl,
-                    )
-                    if new_id:
-                        trade.sl_order_id = new_id
-                    logger.info(f"[Trail] {symbol} SL -> Rs{new_sl:.2f}  "
-                                f"exchange order updated")
+                    # FIX-7: debounce — don't spam modify API on every tick
+                    now_ts = time.time()
+                    last_ts = self._last_sl_modify.get(symbol, 0.0)
+                    if now_ts - last_ts >= self._SL_MODIFY_DEBOUNCE_SECS:
+                        self._last_sl_modify[symbol] = now_ts
+                        new_id = self.order_mgr.modify_sl_order(
+                            sl_order_id  = trade.sl_order_id,
+                            symbol       = symbol,
+                            token        = token,
+                            direction    = trade.direction,
+                            qty          = trade.qty,
+                            new_sl_price = new_sl,
+                        )
+                        if new_id:
+                            trade.sl_order_id = new_id
+                        logger.info(f"[Trail] {symbol} SL -> Rs{new_sl:.2f}  "
+                                    f"exchange order updated")
+                    else:
+                        logger.debug(f"[Trail] {symbol} SL modify debounced "
+                                     f"({now_ts - last_ts:.1f}s < "
+                                     f"{self._SL_MODIFY_DEBOUNCE_SECS}s)")
                 return None  # not an exit
 
-            # Real exit
+            # Real exit — but first check exchange position (FIX-1)
+            # If the SL-M was already triggered by the exchange while algo
+            # was busy, position is already flat. Placing another exit order
+            # would open a fresh opposite position. Check first.
+            if not config.PAPER_TRADE:
+                already_flat = self._is_position_flat_on_exchange(symbol)
+                if already_flat:
+                    logger.info(f"[FIX-1] {symbol} already flat on exchange "
+                                f"(SL-M triggered) — closing trade without new order")
+                    # Close trade using current ltp — no new order placed
+                    self._close_trade_no_order(symbol, ltp, reason="SL-M (exchange)")
+                    return symbol
+
             self.exit(symbol, ltp, result)
             return symbol
 
@@ -625,7 +751,7 @@ class TradeManager:
     # ──────────────────────────────────────────────────────
 
     def exit(self, symbol: str, ltp: float, reason: str) -> Optional[Trade]:
-        trade = self._open.pop(symbol, None)
+        trade = self._open.get(symbol)
         if not trade:
             return None
 
@@ -633,11 +759,11 @@ class TradeManager:
         fill_quality = trade.fill_quality
 
         if config.PAPER_TRADE:
+            self._open.pop(symbol, None)
             sim_exit, exit_fq = self.depth_sim.simulate_exit(
                 symbol, trade.token, trade.direction, trade.qty, ltp
             )
             exit_price = sim_exit
-            # Carry worst fill quality of entry/exit into the record
             rank = {"NORMAL": 0, "FALLBACK_SLIPPAGE": 1, "THIN_BOOK": 2, "LIVE": -1}
             if rank.get(exit_fq, 0) > rank.get(fill_quality, 0):
                 fill_quality = exit_fq
@@ -655,7 +781,25 @@ class TradeManager:
                 ltp       = ltp,
                 reason    = reason,
             )
-            if actual and actual.avg_price > 0:
+
+            # FIX-5: if exit completely failed, do NOT record fake price.
+            # Keep the trade in _open so the next tick retries exit.
+            if actual is None:
+                logger.error(f"[Exit] FIX-5: exit failed for {symbol} — "
+                             f"keeping in _open for retry on next tick")
+                # Re-place SL order to protect open position while we retry
+                new_sl_id = self.order_mgr.place_sl_order(
+                    symbol, trade.token, trade.direction,
+                    trade.qty, trade.sl_price
+                )
+                if new_sl_id:
+                    trade.sl_order_id = new_sl_id
+                    logger.info(f"[Exit] Re-placed SL-M for {symbol} "
+                                f"@ ₹{trade.sl_price:.2f} while awaiting exit retry")
+                return None  # trade stays in _open
+
+            self._open.pop(symbol, None)
+            if actual.avg_price > 0:
                 exit_price = actual.avg_price
 
         trade.fill_quality = fill_quality
@@ -711,11 +855,108 @@ class TradeManager:
     # ──────────────────────────────────────────────────────
 
     def square_off_all(self):
+        """
+        FIX-6: If any exit fails, symbol stays in _open (exit() now keeps it there).
+        Retry every 30s until 15:25 to prevent overnight delivery obligation.
+        """
+        # First pass — exit everything currently open
         for symbol in list(self._open.keys()):
             trade = self._open[symbol]
             print(f"\n[SquareOff] Closing {trade.direction} "
                   f"{symbol} at Rs{trade.ltp:.2f}")
             self.exit(symbol, trade.ltp, "Square-off 15:18")
+
+        # Retry loop for any that failed
+        if not config.PAPER_TRADE and self._open:
+            hard_stop = now_ist().replace(hour=15, minute=20, second=0, microsecond=0)
+            attempt   = 0
+            while self._open and now_ist() < hard_stop:
+                attempt += 1
+                remaining = list(self._open.keys())
+                logger.warning(f"[SquareOff] Retry {attempt} — "
+                               f"{len(remaining)} positions still open: {remaining}")
+                print(f"\n⚠️  [SquareOff] Retry {attempt}: "
+                      f"{len(remaining)} positions still open — retrying in 30s")
+                time.sleep(30)
+                for symbol in list(self._open.keys()):
+                    trade = self._open[symbol]
+                    logger.warning(f"[SquareOff] Retry exit: {symbol} "
+                                   f"{trade.direction} @ Rs{trade.ltp:.2f}")
+                    self.exit(symbol, trade.ltp, "Square-off retry")
+
+            if self._open:
+                # Past 15:25 and still open — critical alert
+                stuck = list(self._open.keys())
+                logger.critical(f"[SquareOff] CRITICAL: Could not square off "
+                                f"{stuck} before 15:25 — DELIVERY RISK! "
+                                f"Close manually on Kotak Neo immediately.")
+                print(f"\n🚨 CRITICAL: Square-off FAILED for {stuck}. "
+                      f"CLOSE MANUALLY ON KOTAK NEO NOW to avoid delivery!")
+
+    def set_telegram(self, telegram_notifier):
+        """Allow main.py to pass telegram notifier for risk alerts."""
+        self._telegram = telegram_notifier
+
+    def _is_position_flat_on_exchange(self, symbol: str) -> bool:
+        """
+        FIX-1: Check if a position is already flat on the exchange
+        (SL-M was triggered while algo was processing other symbols).
+        Returns True if position is closed/flat, False if still open.
+        Falls back to False (assume open) on any API error.
+        """
+        try:
+            resp = self.client.positions()
+            if not resp:
+                return False
+            positions = []
+            if isinstance(resp, dict):
+                positions = resp.get("data", resp.get("net", []))
+            elif isinstance(resp, list):
+                positions = resp
+            for pos in positions:
+                if not isinstance(pos, dict):
+                    continue
+                sym = str(pos.get("trdSym") or pos.get("symbol") or
+                          pos.get("tradingSymbol") or "")
+                if sym.upper().startswith(symbol.upper()):
+                    net_qty = int(float(pos.get("netQty") or
+                                        pos.get("net_qty") or
+                                        pos.get("qty") or 0))
+                    return net_qty == 0
+            # Not found in positions — means it's flat
+            return True
+        except Exception as e:
+            logger.warning(f"[FIX-1] positions() check failed for {symbol}: {e} "
+                           f"— assuming still open")
+            return False
+
+    def _close_trade_no_order(self, symbol: str, ltp: float, reason: str):
+        """
+        FIX-1: Close a trade record locally without placing any exit order.
+        Called when exchange already closed the position (SL-M triggered).
+        """
+        trade = self._open.pop(symbol, None)
+        if not trade:
+            return
+        trade.fill_quality = trade.fill_quality
+        trade.close(ltp, reason)
+        self._closed.append(trade)
+
+        net    = trade.net_pnl
+        is_sl  = reason in ("SL", "Trail SL", "SL-M (exchange)")
+        self.day_pnl_rs += net
+
+        if is_sl:
+            self.consec_sl += 1
+            self._session_blocked.add(symbol)
+
+        if not config.PAPER_TRADE and self.day_pnl_rs <= config.MAX_DAILY_LOSS_RS:
+            print(f"\n[Guard] Daily loss limit Rs{config.MAX_DAILY_LOSS_RS:,.0f} hit")
+            self.day_stopped = True
+
+        print(f"\n[FIX-1] {symbol} was already flat on exchange — "
+              f"closing trade record  Net Rs{net:+.0f}  ({reason})")
+        self.report_mgr.log_trade(trade)
 
     # ──────────────────────────────────────────────────────
     #  print_status
