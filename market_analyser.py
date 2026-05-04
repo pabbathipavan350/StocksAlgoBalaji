@@ -40,6 +40,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("market_analyser")
 
+# Suppress urllib3 connection pool debug spam
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+
 
 # ── IST helpers ──────────────────────────────────────────────
 def now_ist() -> datetime.datetime:
@@ -136,7 +140,7 @@ class IndexFetcher:
         return results
 
     def _fetch_ltp(self, token: str, segment: str):
-        """Single index LTP fetch — multiple response format handlers."""
+        """Single index LTP fetch — mirrors gap_scanner.py's proven parser."""
         try:
             resp = self.client.quotes(
                 instrument_tokens=[{
@@ -149,35 +153,57 @@ class IndexFetcher:
             logger.debug(f"[IndexFetch] quotes() failed for {token}: {e}")
             return None
 
-        # Unwrap various Kotak response shapes
-        data = []
+        # Unwrap — same logic as gap_scanner.py
         if isinstance(resp, list):
             data = resp
         elif isinstance(resp, dict):
-            for key in ("data", "200", "message", "result"):
-                val = resp.get(key)
-                if isinstance(val, list):
-                    data = val
-                    break
+            data = (resp.get("data") or resp.get("200") or
+                    resp.get("message") or resp.get("result") or [])
+        else:
+            data = []
+
+        if not isinstance(data, list):
+            data = [data] if isinstance(data, dict) else []
+
+        # Log raw response once on first call to help debug format issues
+        if not getattr(self, "_logged_sample", False):
+            logger.info(f"[IndexFetch] Sample raw resp for token {token}: "
+                        f"type={type(resp).__name__} "
+                        f"data={str(resp)[:300]}")
+            self._logged_sample = True
 
         for item in data:
             if not isinstance(item, dict):
                 continue
-            # LTP may be nested or flat
+
+            # LTP can be flat or nested dict — handle both
             ltp_raw = item.get("ltp") or item.get("ltP") or item.get("last_price")
+
             if isinstance(ltp_raw, dict):
+                # Nested: {'ltp': {'ltp': '23500.00'}}
                 for f in ("ltp", "ltP", "lp", "last_price"):
-                    if ltp_raw.get(f):
-                        ltp_raw = ltp_raw[f]
+                    v = ltp_raw.get(f)
+                    if v is not None and v != "":
+                        ltp_raw = v
                         break
+
+            if ltp_raw is None:
+                # Some Kotak responses use 'lp' directly on item
+                ltp_raw = item.get("lp") or item.get("last_traded_price")
+
             try:
                 val = float(str(ltp_raw).replace(",", ""))
                 if val > 0:
                     return val
             except (TypeError, ValueError):
-                continue
+                pass
 
+        # Still nothing — log the full item so we can fix it next time
+        logger.debug(f"[IndexFetch] No LTP found for token {token}. "
+                     f"data_len={len(data)} "
+                     f"first_item={str(data[0])[:200] if data else 'empty'}")
         return None
+
 
 
 # ════════════════════════════════════════════════════════════
