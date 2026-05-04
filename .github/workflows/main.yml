@@ -8,23 +8,20 @@ jobs:
     name: Run Main Script
     runs-on: ubuntu-latest
     environment: MyAlog
-    timeout-minutes: 390
+    timeout-minutes: 395
 
     env:
       TZ: Asia/Kolkata
       PYTHONUNBUFFERED: "1"
-
-      KOTAK_CONSUMER_KEY: ${{ secrets.KOTAK_CONSUMER_KEY }}
+      KOTAK_CONSUMER_KEY:    ${{ secrets.KOTAK_CONSUMER_KEY }}
       KOTAK_CONSUMER_SECRET: ${{ secrets.KOTAK_CONSUMER_SECRET }}
-      KOTAK_MOBILE_NUMBER: ${{ secrets.KOTAK_MOBILE_NUMBER }}
-      KOTAK_UCC: ${{ secrets.KOTAK_UCC }}
-      KOTAK_MPIN: ${{ secrets.KOTAK_MPIN }}
-      TOTP_SECRET_KEY: ${{ secrets.TOTP_SECRET_KEY }}
-
-      KOTAK_ENVIRONMENT: "PROD"
-
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      KOTAK_MOBILE_NUMBER:   ${{ secrets.KOTAK_MOBILE_NUMBER }}
+      KOTAK_UCC:             ${{ secrets.KOTAK_UCC }}
+      KOTAK_MPIN:            ${{ secrets.KOTAK_MPIN }}
+      TOTP_SECRET_KEY:       ${{ secrets.TOTP_SECRET_KEY }}
+      KOTAK_ENVIRONMENT:     "PROD"
+      TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout code
@@ -36,8 +33,7 @@ jobs:
           python-version: "3.11"
 
       - name: Prepare folders
-        run: |
-          mkdir -p logs reports
+        run: mkdir -p logs reports
 
       - name: Show env presence check
         run: |
@@ -53,13 +49,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore capital state
+      - name: Restore persistent state
         uses: actions/cache/restore@v4
         with:
-          path: capital.json
-          key: capital-state-${{ github.ref_name }}
+          path: reports/
+          key: algo-reports-${{ github.ref_name }}-${{ github.run_number }}
           restore-keys: |
-            capital-state-
+            algo-reports-${{ github.ref_name }}-
+
+      - name: Show restored state
+        run: |
+          echo "=== pattern_30d.json ==="
+          python3 -c "
+          import json, os
+          f = 'reports/pattern_30d.json'
+          if os.path.exists(f):
+              data = json.load(open(f))
+              print(f'  {len(data)} days of history restored')
+              for d in data[-3:]:
+                  print(f'  {d[chr(34)]date{chr(34)}}  regime={d.get(chr(34)regime{chr(34)},chr(34)?{chr(34)})}  pnl=Rs{d.get(chr(34)net_pnl{chr(34)},0):+,.0f}')
+          else:
+              print('  Not found - first run or no history yet')
+          " 2>/dev/null || echo "  (could not read)"
+          echo "=== daily_history.json ==="
+          python3 -c "
+          import json, os
+          f = 'reports/daily_history.json'
+          if os.path.exists(f):
+              data = json.load(open(f))
+              print(f'  {len(data)} days of algo history restored')
+          else:
+              print('  Not found - first run')
+          " 2>/dev/null || echo "  (could not read)"
 
       - name: Run algo and capture full logs
         run: |
@@ -93,13 +114,12 @@ jobs:
           path: |
             logs/**
             reports/**
-            capital.json
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Save capital state
+      - name: Save persistent state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: capital.json
-          key: capital-state-${{ github.ref_name }}-${{ github.run_number }}
+          path: reports/
+          key: algo-reports-${{ github.ref_name }}-${{ github.run_number }}
