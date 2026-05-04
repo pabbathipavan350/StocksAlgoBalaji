@@ -28,6 +28,7 @@ from trade_manager      import TradeManager
 from report_manager     import ReportManager
 from telegram_notifier  import TelegramNotifier
 from session_manager    import SessionManager
+from market_analyser    import create_analyser
 
 
 def now_ist() -> datetime.datetime:
@@ -139,6 +140,9 @@ class GapVWAPAlgo:
 
         self.trade_mgr = TradeManager(self.client, self.report_mgr)
         self.trade_mgr.set_telegram(self.telegram)  # FIX-3: partial fill alerts
+
+        # Market analyser — runs in background daemon thread, never blocks algo
+        self.market_analyser = create_analyser(self.client)
 
         self.scrip_master = ScripMaster(self.client)
         scrips = self.scrip_master.load(mode=config.WATCHLIST_MODE)
@@ -1059,6 +1063,10 @@ class GapVWAPAlgo:
         except Exception as e:
             self.logger.error(f"[Shutdown] report error: {e}")
         try:
+            self.market_analyser.generate_eod_report()
+        except Exception as e:
+            self.logger.error(f"[Shutdown] market analyser report error: {e}")
+        try:
             self.report_mgr.close()
         except Exception:
             pass
@@ -1150,6 +1158,10 @@ class GapVWAPAlgo:
                     self._entries_open = False
                     sq_done            = True
                     self._running      = False
+                    try:
+                        self.market_analyser.generate_eod_report()
+                    except Exception as e:
+                        self.logger.error(f"[Main] market analyser EOD error: {e}")
 
                 # ── Status print every minute ─────────────
                 if gap_scanned and t.minute != last_status_min:
