@@ -65,29 +65,32 @@ def market_open() -> bool:
 # If a token changes or is unavailable, that index is skipped
 # gracefully — it never stops the snapshot loop.
 
+# Index definitions — token, tried across multiple segments because
+# Kotak Neo serves index quotes on different segments depending on version.
+# fetch_all() tries each segment until one returns a valid LTP.
 INDICES = [
-    # Major broad market
-    ("NIFTY 50",          "26000", "nse_cm"),
-    ("NIFTY BANK",        "26009", "nse_cm"),
-    ("NIFTY MIDCAP 100",  "26012", "nse_cm"),
-    ("NIFTY SMALLCAP 100","26034", "nse_cm"),
-    ("NIFTY 500",         "26004", "nse_cm"),
-    ("NIFTY 200",         "26013", "nse_cm"),
-
-    # Sectoral — useful for understanding gap behaviour
-    ("NIFTY IT",          "26017", "nse_cm"),
-    ("NIFTY FMCG",        "26035", "nse_cm"),
-    ("NIFTY AUTO",        "26008", "nse_cm"),
-    ("NIFTY PHARMA",      "26016", "nse_cm"),
-    ("NIFTY REALTY",      "26018", "nse_cm"),
-    ("NIFTY METAL",       "26015", "nse_cm"),
-    ("NIFTY ENERGY",      "26019", "nse_cm"),
-    ("NIFTY INFRA",       "26020", "nse_cm"),
-    ("NIFTY PSU BANK",    "26014", "nse_cm"),
-    ("NIFTY MIDCAP 50",   "26011", "nse_cm"),
-    ("NIFTY NEXT 50",     "26001", "nse_cm"),
-    ("NIFTY MICROCAP 250","26083", "nse_cm"),
+    ("NIFTY 50",           "26000"),
+    ("NIFTY BANK",         "26009"),
+    ("NIFTY MIDCAP 100",   "26012"),
+    ("NIFTY SMALLCAP 100", "26034"),
+    ("NIFTY 500",          "26004"),
+    ("NIFTY 200",          "26013"),
+    ("NIFTY IT",           "26017"),
+    ("NIFTY FMCG",         "26035"),
+    ("NIFTY AUTO",         "26008"),
+    ("NIFTY PHARMA",       "26016"),
+    ("NIFTY REALTY",       "26018"),
+    ("NIFTY METAL",        "26015"),
+    ("NIFTY ENERGY",       "26019"),
+    ("NIFTY INFRA",        "26020"),
+    ("NIFTY PSU BANK",     "26014"),
+    ("NIFTY MIDCAP 50",    "26011"),
+    ("NIFTY NEXT 50",      "26001"),
+    ("NIFTY MICROCAP 250", "26083"),
 ]
+
+# Segments to try for index quotes — Kotak Neo varies by version
+INDEX_SEGMENTS = ["nse_fo", "nse_cm", "nse_idx", "bse_cm"]
 
 SNAPSHOT_INTERVAL_MINS = 5   # snapshot every 5 minutes
 REPORTS_DIR            = "reports"
@@ -111,21 +114,21 @@ class IndexFetcher:
         """
         Returns dict: {index_name: {"ltp": float, "open": float,
                                      "change_pct": float, "token": str}}
-        Missing indices are absent from the dict — never raises.
+        Tries multiple exchange segments per token until one works.
+        Caches the working segment so future calls skip the trial loop.
         """
         results = {}
-        for name, token, segment in INDICES:
+        for name, token in INDICES:
             try:
-                ltp = self._fetch_ltp(token, segment)
+                ltp = self._fetch_ltp_any_segment(token)
                 if ltp is None or ltp <= 0:
                     continue
 
-                # Track open price (first snapshot of the day)
                 if name not in self._open_prices:
                     self._open_prices[name] = ltp
 
-                open_px     = self._open_prices[name]
-                change_pct  = round((ltp - open_px) / open_px * 100, 3) if open_px else 0.0
+                open_px    = self._open_prices[name]
+                change_pct = round((ltp - open_px) / open_px * 100, 3) if open_px else 0.0
 
                 results[name] = {
                     "ltp"        : round(ltp, 2),
@@ -138,6 +141,35 @@ class IndexFetcher:
                 continue
 
         return results
+
+    def _fetch_ltp_any_segment(self, token: str):
+        """
+        Try each segment in INDEX_SEGMENTS until we get a valid LTP.
+        Once a working segment is found it is cached in _working_segment
+        so subsequent calls go straight to it.
+        """
+        # Use cached working segment first
+        cached = getattr(self, "_working_segment", None)
+        if cached:
+            ltp = self._fetch_ltp(token, cached)
+            if ltp and ltp > 0:
+                return ltp
+            # Cached segment stopped working — reset and re-probe
+            logger.info(f"[IndexFetch] Cached segment '{cached}' no longer working — re-probing")
+            self._working_segment = None
+
+        for segment in INDEX_SEGMENTS:
+            try:
+                ltp = self._fetch_ltp(token, segment)
+                if ltp and ltp > 0:
+                    self._working_segment = segment
+                    logger.info(f"[IndexFetch] ✅ Working segment found: '{segment}' "
+                                f"for token {token} → LTP {ltp}")
+                    return ltp
+            except Exception:
+                continue
+
+        return None
 
     def _fetch_ltp(self, token: str, segment: str):
         """Single index LTP fetch — mirrors gap_scanner.py's proven parser."""
