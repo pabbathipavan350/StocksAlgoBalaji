@@ -103,14 +103,22 @@ def get_kotak_session() -> NeoAPI:
         totp_code  = generate_totp()
         if not totp_code:
             raise Exception("TOTP retry failed — TOTP_SECRET_KEY may be wrong")
-        try:
-            login_resp = client.totp_login(
-                mobilenumber=config.KOTAK_MOBILE_NUMBER,
-                ucc=config.KOTAK_UCC,
-                totp=totp_code,
-            )
-        except Exception as e:
-            raise Exception(f"TOTP Login retry failed: {e}")
+        login_resp = None
+        for fn_kwargs in [
+            {"mobilenumber": config.KOTAK_MOBILE_NUMBER, "ucc": config.KOTAK_UCC, "totp": totp_code},
+            {"mobile_number": config.KOTAK_MOBILE_NUMBER, "ucc": config.KOTAK_UCC, "totp": totp_code},
+            {"ucc": config.KOTAK_UCC, "totp": totp_code},
+        ]:
+            try:
+                login_resp = client.totp_login(**fn_kwargs)
+                if login_resp is not None and not (isinstance(login_resp, dict) and login_resp.get("error")):
+                    break
+            except TypeError:
+                continue
+            except Exception as e:
+                raise Exception(f"TOTP Login retry failed: {e}")
+        if login_resp is None or (isinstance(login_resp, dict) and login_resp.get("error")):
+            raise Exception(f"TOTP Login retry failed after all attempts: {login_resp}")
 
     print("TOTP Login: SUCCESS")
 

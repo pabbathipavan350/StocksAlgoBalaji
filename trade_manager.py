@@ -537,6 +537,11 @@ class TradeManager:
                 entry_price, fill_quality = self.depth_sim.simulate_entry(
                     symbol, token, direction, calc_qty(ltp), ltp
                 )
+                # Skip thin book entries if configured
+                if (fill_quality == "THIN_BOOK"
+                        and getattr(config, "SKIP_THIN_BOOK", False)):
+                    logger.info(f"[ThinBook] {symbol} skipped — THIN_BOOK fill detected")
+                    return None
             else:
                 # FIX-2: place_entry() called OUTSIDE lock below.
                 # Only do pre-checks here; release lock before the slow network call.

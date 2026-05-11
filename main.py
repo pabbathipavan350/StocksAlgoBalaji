@@ -41,6 +41,11 @@ def setup_logging():
     fmt      = "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
     root     = logging.getLogger()
     root.setLevel(logging.DEBUG)
+
+    # Suppress noisy third-party debug logs
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
     fh = logging.handlers.RotatingFileHandler(
         log_file, maxBytes=20*1024*1024, backupCount=5, encoding="utf-8")
     fh.setLevel(logging.DEBUG)

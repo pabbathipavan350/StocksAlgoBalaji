@@ -128,8 +128,8 @@ BREAKOUT_DIST_PCT    = 0.5
 BREAKOUT_VOL_MULT    = 1.8
 
 # ── SL & Target ───────────────────────────────────────────
-SL_PCT               = 0.8       # WIDENED from 0.5% — survive normal noise
-                                  # 0.5% was being stopped by 1-2 candle wicks
+SL_PCT               = 0.5       # TIGHTENED back to 0.5% — better R:R
+                                  # 0.8% was too wide, avg loss was ₹950 vs avg win ₹700
                                   # on stocks that eventually moved correctly
 
 TRAIL_TRIGGER_PCT    = 1.0       # Trail activates at +1% profit
@@ -213,6 +213,7 @@ WATCHLIST_FILE       = "watchlist.csv"
 #                      in the log so you can review after 30 days.
 PAPER_SLIPPAGE_PCT   = 0.15   # 0.15% per side fallback slippage
 MAX_BOOK_WALK_PCT    = 0.5    # walk up to 0.5% deep into the book
+SKIP_THIN_BOOK       = True   # Skip entries where depth sim returns THIN_BOOK fill
 
 # ── Costs (equity intraday) ───────────────────────────────
 BROKERAGE_PCT        = 0.0
